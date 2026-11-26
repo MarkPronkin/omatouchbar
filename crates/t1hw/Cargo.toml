@@ -1,0 +1,11 @@
+[package]
+name = "t1hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log = "0.4.35"
+rustix = { version = "1.1.6", features = ["net", "fs", "mm", "event", "time", "process"] }

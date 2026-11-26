@@ -1,0 +1,5 @@
+/target
+*.png
+!packaging/*.png
+# Unrelated local notes that happen to live in this folder.
+/battery/

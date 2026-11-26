@@ -1,0 +1,20 @@
+[package]
+name = "omatouchbar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono = "0.4.45"
+inotify = { version = "0.11.5", default-features = false }
+log = "0.4.35"
+omatouchbar-core = { version = "0.1.0", path = "../core" }
+rustix = { version = "1.1.6", features = ["net", "fs", "mm", "event", "time", "process", "stdio"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+signal-hook = "0.4.6"
+t1hw = { version = "0.1.0", path = "../t1hw" }
+toml = "1.2.3"
+zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
