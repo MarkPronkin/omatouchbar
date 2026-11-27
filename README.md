@@ -212,13 +212,33 @@ omatouchbar restore-bar            # show the on-screen bar if omatouchbar hid i
 
 Logs: `journalctl --user -u t1-touchbar.service -f`.
 
+### Touch input API
+
+Use `omatouchbar ctl controls` to get the strip dimensions and current touch targets as JSON. Each target has an opaque ID, its visible label, its gesture kind, a point `x,y` inside it, and pixel bounds in the order left, top, right, bottom. Query again after changing pages, scrolling or holding Fn.
+
+```sh
+omatouchbar ctl controls
+omatouchbar ctl tap 120 30
+omatouchbar ctl hold 120 30 750
+omatouchbar ctl drag 800 30 350 30 400
+```
+
+Coordinates are pixels from the top left. The last argument to `hold` and `drag` is the duration in milliseconds (1–60000). These commands use the physical input handler, including its wake behavior, scrolling, key repeat, slider limits and haptic feedback.
+
+For multi-touch, Fn, and text entry, use `omatouchbar ctl input` or connect directly to the renderer's Unix stream at `$XDG_RUNTIME_DIR/omatouchbar.sock`. On the socket, send `input\n` and wait for `ok`. Send one JSON frame per line and read one reply per frame. The renderer advertises `inputProtocol: 1` in `status`. Each frame supplies the complete current state. Up to ten contacts may be held at once, each with a distinct ID from 0 to 255. Keep the ID while moving a finger and omit it to release. An empty object releases all fingers and Fn.
+
+```sh
+printf '%s\n' '{"fn":true}' '{"fn":true,"contacts":[[0,250,30]]}' '{}' | omatouchbar ctl input
+```
+
+While a Touch Bar text prompt is active, a frame can also include `"key":{"text":"Copenhagen"}`, `"key":{"paste":"text"}`, `"key":{"select":1}`, or a key name such as `"key":"enter"`, `"backspace"`, `"clear"` or `"escape"`. A socket client finishes with the line `end`. The CLI does this at EOF. Explicitly release with `{}` to complete a tap or drag. Disconnecting, leaving a session idle for 30 seconds, or touching the physical strip cancels outstanding scripted contacts. A second input session receives a busy error. Other control commands remain available during a hold.
+
 ### Trackpad Haptics
 
-Install the separate **Trackpad Haptics** project and open **Setup → Trackpad
-Haptics** to enable Touch Bar feedback. The renderer sends gesture events to
-its optional user service. The app owns the Apple SPI driver, pulse patterns
-and saved preferences. Omatouchbar also runs independently when the player
-is absent.
+Turn **Touch Bar haptics** on or off under **Setup → Touch Bar → Motion**.
+The switch is on by default and applies live. Feedback requires the separate
+**Trackpad Haptics** service, which plays Touch Bar gestures through the
+trackpad.
 
 In bar mode, hold the volume or brightness button for a firm click as it
 expands into a slider. Sliding sideways on the button also opens it. Drag
@@ -244,9 +264,10 @@ These cues follow T1Bridge's reported stages. The idle sensor and a prompt
 waiting for your finger stay quiet. To feel the sequence on the Touch Bar,
 run `omatouchbar ctl touchid unlock` or `omatouchbar ctl touchid enroll`.
 
-The advanced controls `omatouchbar ctl haptics medium|zoned|on|off` use the
-same saved preference as the app. Medium gives each button the same click.
-Zoned varies the strength across the strip. On selects the original firm click.
+Scripts can persist the same switch with `omatouchbar ctl haptics on` or `off`.
+The renderer sends `v1 gesture` requests to the trackpad player. Install the
+renderer and a player whose `trackpad-haptics capabilities` lists the Touch Bar
+gestures. Older players used the `medium` and `zoned` mode names.
 
 ## Settings
 

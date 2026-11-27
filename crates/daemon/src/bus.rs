@@ -35,8 +35,10 @@ pub enum Event {
         entries: Vec<omatouchbar_core::state::TrayMenuEntry>,
     },
     Control(Command, mpsc::Sender<String>),
-    Status(mpsc::Sender<String>),
-    Haptics(crate::haptics::Haptics, mpsc::Sender<String>),
+    Controls(mpsc::Sender<String>),
+    Input(u64, crate::input::Request, mpsc::Sender<String>),
+    Status(bool, mpsc::Sender<String>),
+    Haptics(bool, mpsc::Sender<String>),
     /// Save the current frame as a PNG (debugging and the settings app).
     Snapshot(String, mpsc::Sender<String>),
     Reload,

@@ -133,15 +133,19 @@ impl App {
         let app = self.clone();
         let source = glib::timeout_add_local_once(Duration::from_millis(250), move || {
             app.save.borrow_mut().take();
-            if app.dry_run {
-                return;
-            }
-            match app.config.borrow().save() {
-                Ok(()) => app.run("saved"),
-                Err(e) => app.toast(&format!("Could not save settings: {e}")),
-            }
+            app.save_settings();
         });
         *self.save.borrow_mut() = Some(source);
+    }
+
+    fn save_settings(&self) {
+        if self.dry_run {
+            return;
+        }
+        match self.config.borrow().save() {
+            Ok(()) => self.run("saved"),
+            Err(e) => self.toast(&format!("Could not save settings: {e}")),
+        }
     }
 
     pub fn on_config(&self, f: impl Fn(&Config) + 'static) {
@@ -900,6 +904,10 @@ fn build(application: &adw::Application, options: &Options) {
         let ui = ui.clone();
         window.connect_close_request(move |window| {
             let _ = (&styler, &ui.card);
+            if let Some(source) = ui.app.save.take() {
+                source.remove();
+                ui.app.save_settings();
+            }
             if layered && let Some(surface) = window.surface().and_downcast::<gdk::Toplevel>() {
                 surface.restore_system_shortcuts();
             }

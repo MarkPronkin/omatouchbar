@@ -13,6 +13,7 @@ chrono-tz = "0.10.4"
 log = "0.4.35"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3"
 tiny-skia = "0.12.0"
 toml = "1.2.3"
 

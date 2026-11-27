@@ -203,6 +203,7 @@ pub fn row(title: &str, caption: &str, control: Option<&gtk::Widget>) -> gtk::Bo
         control.set_valign(gtk::Align::Center);
         row.append(control);
         if let Some(switch) = control.downcast_ref::<gtk::Switch>() {
+            switch.update_property(&[gtk::accessible::Property::Label(title)]);
             let click = gtk::GestureClick::new();
             let (switch, row_ref) = (switch.clone(), row.downgrade());
             click.connect_released(move |gesture, _, x, y| {

@@ -35,7 +35,8 @@ use crate::{
 };
 
 /// Keyboard events delivered to the Touch Bar while a text prompt is active.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum KeyInput {
     Text(String),
     Backspace,
@@ -1595,6 +1596,30 @@ impl Scene {
 
     // ---------------------------------------------------------------- touch
 
+    /// Cancel a lost input source without firing release actions on its behalf.
+    pub fn cancel_input(&mut self, now: Instant) {
+        self.now = now;
+        if self
+            .touches
+            .values()
+            .any(|touch| touch.kind == Some(HitKind::WorldDrag))
+        {
+            self.world_input(WorldInput::CancelDrag);
+        }
+        for (_, touch) in self.touches.drain() {
+            if let Some(key) = touch.key {
+                self.animator.press(key, false, None, false);
+            }
+        }
+        self.scroll.dragging = false;
+        self.finish_quick_slider();
+        for (_, release) in self.overrides.values_mut() {
+            release.get_or_insert(now + SLIDER_HOLD);
+        }
+        self.input(false, &[], now);
+        self.dirty = true;
+    }
+
     /// Feeds one input frame: every contact currently touching, in display
     /// coordinates. Returns true when a new contact presses a button.
     pub fn input(&mut self, fn_pressed: bool, contacts: &[(u8, f32, f32)], now: Instant) -> bool {
@@ -1660,6 +1685,64 @@ impl Scene {
     fn hit_test(&self, x: f32, y: f32, pad: f32) -> Option<Key> {
         self.animator
             .hit_test_visible(x, y, pad, |a| self.touch_rect(a, x))
+    }
+
+    /// Visible input targets, in the same pixel coordinates as a hardware frame.
+    pub fn controls(&self) -> serde_json::Value {
+        use crate::node::Part;
+        let controls: Vec<_> = self
+            .animator
+            .items
+            .iter()
+            .filter_map(|item| {
+                let kind = item.node.hit.as_ref()?.kind;
+                let bounds = item.rect().offset(-self.group_offset(item.node.group));
+                let mut left = bounds.x.max(0.0);
+                let mut right = bounds.right().min(self.width);
+                if item.node.group == Some(0)
+                    && let Some(row) = self.scroll.clip()
+                {
+                    left = left.max(row.x0);
+                    right = right.min(row.x1);
+                }
+                let top = bounds.y.max(0.0);
+                let bottom = (bounds.y + bounds.h).min(self.height);
+                if right <= left || bottom <= top {
+                    return None;
+                }
+                let x = ((left + right) * 0.5).floor();
+                let y = ((top + bottom) * 0.5).floor();
+                if self.hit_test(x, y, 0.0) != Some(item.node.key) {
+                    return None;
+                }
+                let label = item
+                    .node
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Part::Text { text, .. } | Part::SplitText { text, .. } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let kind = match kind {
+                    HitKind::WorldDrag => "drag",
+                    HitKind::Tap => "tap",
+                    HitKind::TapSlide(_) => "tap-slide",
+                    HitKind::Down => "press",
+                    HitKind::Repeat => "repeat",
+                    HitKind::Slider => "slider",
+                    HitKind::Scrub(_) => "scrub",
+                };
+                Some(
+                    serde_json::json!({"id": format!("{:016x}", item.node.key.0), "label": label,
+                "kind": kind, "x": x as u32, "y": y as u32, "bounds": [left, top, right, bottom]}),
+                )
+            })
+            .collect();
+        serde_json::json!({"width": self.width as u32, "height": self.height as u32, "controls": controls})
     }
 
     fn touch_rect(&self, a: &Animated, x: f32) -> Option<Rect> {

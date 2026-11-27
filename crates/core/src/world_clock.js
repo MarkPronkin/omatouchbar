@@ -932,6 +932,10 @@ async function dispatch(req) {
         await actions.get(req.value)?.();
         fetchProfiles();
         break;
+      case 'cancelDrag':
+        clearTimeout(scrubReset);
+        shift = 0;
+        break;
       case 'drag':
         drag(req.value);
         break;

@@ -702,6 +702,27 @@ pub fn motion(app: &Rc<App>) -> gtk::Widget {
         "Motion",
         "Spring physics drive every movement on the Touch Bar.",
     );
+    page.body.append(&ui::section("Touch feedback", ""));
+    page.body.append(
+        &ui::toggle_row(
+            app,
+            "Touch Bar haptics",
+            "Feel Touch Bar clicks and ticks through the trackpad. Requires Trackpad Haptics.",
+            |c| c.haptics,
+            |c, v| c.haptics = v,
+        )
+        .0,
+    );
+    page.body.append(
+        &ui::toggle_row(
+            app,
+            "Touch ripples",
+            "Ink spreads from where you touch",
+            |c| c.motion.ripple,
+            |c, v| c.motion.ripple = v,
+        )
+        .0,
+    );
     page.body.append(&ui::section("Animation", ""));
     page.body.append(
         &ui::toggle_row(
@@ -740,16 +761,6 @@ pub fn motion(app: &Rc<App>) -> gtk::Widget {
         |c| c.motion.stagger_ms as f64,
         |c, v| c.motion.stagger_ms = v as f32,
     ));
-    page.body.append(
-        &ui::toggle_row(
-            app,
-            "Touch ripples",
-            "Ink spreads from where you touch",
-            |c| c.motion.ripple,
-            |c, v| c.motion.ripple = v,
-        )
-        .0,
-    );
     page.body.append(&ui::stepper_row(
         app,
         "Frame rate",

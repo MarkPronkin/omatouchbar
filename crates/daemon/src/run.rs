@@ -3,7 +3,7 @@
 use std::{
     io::Read,
     os::{fd::AsFd, unix::net::UnixStream},
-    sync::mpsc::Receiver,
+    sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant},
 };
 
@@ -21,7 +21,6 @@ use crate::{
     bus::{Bus, Event, Watched},
     control,
     exec::Exec,
-    haptics::Haptics,
     hw::Hw,
     providers::{self, system},
     screensaver::SaverEvent,
@@ -37,7 +36,13 @@ fn apply_bar_policy(config: &Config) {
     }
 }
 
-fn status(scene: &Scene, hw: &Hw, exec: &Exec) -> String {
+fn apply_config(scene: &mut Scene, exec: &mut Exec, config: Config) {
+    apply_bar_policy(&config);
+    exec.haptics.set_enabled(config.haptics);
+    scene.set_config(config);
+}
+
+fn status(scene: &Scene, hw: &Hw, exec: &Exec, playback: bool) -> String {
     let (w, h) = hw.size().unwrap_or((0, 0));
     let page = match scene.page() {
         Page::Bar => "bar".to_string(),
@@ -49,7 +54,7 @@ fn status(scene: &Scene, hw: &Hw, exec: &Exec) -> String {
         Page::Panel(Panel::Brightness) => "panel:brightness".into(),
         Page::Panel(p) => format!("panel:{}", p.title().to_lowercase()),
     };
-    let haptics = exec.haptics.mode();
+    let haptics = playback && scene.config().haptics;
     serde_json::json!({
         "running": true,
         "pid": std::process::id(),
@@ -63,9 +68,10 @@ fn status(scene: &Scene, hw: &Hw, exec: &Exec) -> String {
         "mode": format!("{:?}", scene.config().mode).to_lowercase(),
         "page": page,
         "systemBarHidden": sysbar::is_hidden(),
+        "inputProtocol": 1,
         "hapticsProtocol": 1,
-        "haptics": haptics != Haptics::Off,
-        "hapticMode": haptics.command(),
+        "haptics": haptics,
+        "hapticMode": if haptics { "on" } else { "off" },
         "brightness": scene.brightness(),
         "screensaver": scene.screensaver_active().then(|| exec.screensaver.effect()).flatten(),
     })
@@ -129,7 +135,7 @@ pub fn run() -> i32 {
     };
     scene.set_state(state.clone());
 
-    let mut exec = Exec::new(bus.clone(), (width, height));
+    let mut exec = Exec::new(bus.clone(), (width, height), scene.config().haptics);
     let mut kbd = crate::kbd::KeyboardGrab::new();
     let (refresh, hyprland) = providers::start(&bus, exec.sink.clone());
     exec.refresh = refresh;
@@ -141,6 +147,8 @@ pub fn run() -> i32 {
 
     let mut events = Vec::new();
     let mut last_frame = Instant::now() - Duration::from_secs(1);
+    let mut input = crate::input::Input::default();
+    let mut replies = Vec::new();
     let mut need_frame = true;
     let mut contacts: Vec<(u8, f32, f32)> = Vec::new();
     let mut starved_since: Option<Instant> = None;
@@ -203,6 +211,8 @@ pub fn run() -> i32 {
                 &canvas,
                 &mut exec,
                 &mut theme_sync,
+                &mut input,
+                &mut replies,
             );
         }
         let t_events = woke.elapsed();
@@ -231,12 +241,12 @@ pub fn run() -> i32 {
                         .collect::<Vec<_>>(),
                     slept.as_millis()
                 );
-                if let Some(position) = scene.input_press_position(frame.fn_pressed, &contacts, now)
-                {
-                    exec.haptics.press(position);
-                }
+                input.physical(&mut scene, &exec.haptics, frame.fn_pressed, &contacts, now);
                 need_frame = true;
             }
+        }
+        if !hw.connected() {
+            input.disconnected(&mut scene, now);
         }
         if !hw.connected() && hw.try_connect(now) {
             if let Some((w, h)) = hw.size()
@@ -268,6 +278,11 @@ pub fn run() -> i32 {
         kbd.set_active(scene.wants_keyboard(), &bus);
         for action in scene.take_actions() {
             exec.run(action, &mut hw, scene.config());
+        }
+        // The next frame or controls query from a script must see the layout
+        // produced by the frame it just submitted (for example after Fn).
+        for (reply, result) in replies.drain(..) {
+            let _ = reply.send(result);
         }
         exec.reap();
 
@@ -338,6 +353,8 @@ fn handle_events(
     canvas: &Canvas,
     exec: &mut Exec,
     theme_sync: &mut ThemeSync,
+    input: &mut crate::input::Input,
+    replies: &mut Vec<(Sender<String>, String)>,
 ) {
     let mut state_changed = false;
     for event in rx.try_iter() {
@@ -350,8 +367,7 @@ fn handle_events(
                 Watched::Config => match Config::load() {
                     Ok(config) => {
                         log::info!("settings changed");
-                        apply_bar_policy(&config);
-                        scene.set_config(config);
+                        apply_config(scene, exec, config);
                     }
                     Err(e) => log::warn!("config.toml: {e}"),
                 },
@@ -388,22 +404,35 @@ fn handle_events(
                 if mode_change {
                     apply_bar_policy(scene.config());
                 }
-                let _ = reply.send("ok".into());
+                replies.push((reply, "ok".into()));
             }
-            Event::Status(reply) => {
-                let _ = reply.send(status(scene, hw, exec));
+            Event::Controls(reply) => {
+                let _ = reply.send(scene.controls().to_string());
             }
-            Event::Haptics(mode, reply) => {
-                if !hw.connected() {
-                    let _ = reply.send("error: Touch Bar disconnected".into());
-                    continue;
-                }
-                // Enabling plays the same pulse as a press at the strip's center.
-                let result = exec.haptics.set_mode(mode);
-                let _ = reply.send(match result {
-                    Ok(()) => "ok".into(),
-                    Err(e) => format!("error: Trackpad Haptics unavailable: {e}"),
+            Event::Input(id, request, reply) => {
+                let result = input.request(
+                    id,
+                    request,
+                    scene,
+                    hw.connected().then_some(&exec.haptics),
+                    (canvas.width(), canvas.height()),
+                );
+                replies.push((
+                    reply,
+                    result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
+                ));
+            }
+            Event::Status(playback, reply) => {
+                let _ = reply.send(status(scene, hw, exec, playback));
+            }
+            Event::Haptics(enabled, reply) => {
+                let result = Config::load().and_then(|mut config| {
+                    config.haptics = enabled;
+                    config.save().map_err(|e| e.to_string())?;
+                    apply_config(scene, exec, config);
+                    Ok(())
                 });
+                let _ = reply.send(result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()));
             }
             Event::Snapshot(path, reply) => {
                 let result = match canvas.save_png(std::path::Path::new(&path)) {
@@ -414,8 +443,7 @@ fn handle_events(
             }
             Event::Reload => {
                 if let Ok(config) = Config::load() {
-                    apply_bar_policy(&config);
-                    scene.set_config(config);
+                    apply_config(scene, exec, config);
                 }
                 if let Some(palette) = Palette::load() {
                     scene.set_palette(palette);

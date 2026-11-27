@@ -29,6 +29,7 @@ pub enum Input {
     Clear,
     Enter,
     Select(i8),
+    CancelDrag,
     Drag {
         id: String,
         fraction: f32,

@@ -3,7 +3,10 @@
 //! The settings app writes this file; the renderer watches it and applies
 //! changes live. Every field has a default, so a partial file is valid.
 
-use std::{io, path::PathBuf};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -231,6 +234,8 @@ pub struct Config {
     pub show_escape: bool,
     /// Show the on-screen OSD when the Touch Bar changes volume/brightness.
     pub osd: bool,
+    /// Send Touch Bar feedback to the Trackpad Haptics service.
+    pub haptics: bool,
     /// Play Omarchy's screensaver on the Touch Bar while it runs on the
     /// desktop.
     pub screensaver: bool,
@@ -248,6 +253,7 @@ impl Default for Config {
             hide_system_bar: true,
             show_escape: true,
             osd: false,
+            haptics: true,
             screensaver: true,
             layout: Layout::default(),
             appearance: Appearance::default(),
@@ -288,12 +294,12 @@ impl Config {
     /// Atomically writes the config file.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let temporary = path.with_extension("toml.tmp");
-        std::fs::write(&temporary, self.to_toml())?;
-        std::fs::rename(&temporary, &path)
+        let dir = path.parent().expect("config file has a parent directory");
+        std::fs::create_dir_all(dir)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+        temporary.write_all(self.to_toml().as_bytes())?;
+        temporary.persist(path)?;
+        Ok(())
     }
 
     pub fn sanitize(&mut self) {
@@ -336,13 +342,16 @@ mod tests {
         assert_eq!(partial.mode, Mode::Function);
         assert_eq!(partial.motion.speed, 3.0);
         assert!(partial.show_escape);
+        assert!(partial.haptics);
         assert!(partial.screensaver);
         assert!(partial.appearance.brightness_percentage);
         assert!(partial.appearance.weather_temperature);
         assert!(!partial.appearance.now_playing);
         assert!(partial.layout.center_end.is_empty());
         assert_eq!(Config::parse("").unwrap().mode, Mode::Keyboard);
-        let bar = Config::parse("mode = \"bar\"\n").unwrap();
+        let bar = Config::parse("mode = \"bar\"\nhaptics = false\n").unwrap();
         assert_eq!(bar.mode, Mode::Bar);
+        assert!(!bar.haptics);
+        assert_eq!(Config::parse(&bar.to_toml()).unwrap(), bar);
     }
 }

@@ -220,7 +220,10 @@ fn run(bus: Bus) -> std::io::Result<()> {
                         pending.insert(kind, Instant::now());
                     }
                     for (_, kind) in &entries[i].files {
-                        if matches!(kind, Watched::WeatherLocation | Watched::TouchId) {
+                        if matches!(
+                            kind,
+                            Watched::Config | Watched::WeatherLocation | Watched::TouchId
+                        ) {
                             pending.insert(*kind, Instant::now());
                         }
                     }

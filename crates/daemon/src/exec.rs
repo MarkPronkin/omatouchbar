@@ -56,9 +56,9 @@ pub struct Exec {
 }
 
 impl Exec {
-    pub fn new(bus: Bus, size: (u32, u32)) -> Exec {
+    pub fn new(bus: Bus, size: (u32, u32), haptics_enabled: bool) -> Exec {
         Exec {
-            haptics: crate::haptics::Player::new(),
+            haptics: crate::haptics::Player::new(haptics_enabled),
             screensaver: crate::screensaver::Mirror::new(bus.clone(), size),
             children: Vec::new(),
             world: {

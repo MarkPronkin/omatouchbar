@@ -16,7 +16,6 @@ use omatouchbar_core::{
 };
 
 use crate::bus::{Bus, Event};
-use crate::haptics::Haptics;
 
 pub fn parse(words: &[&str]) -> Result<Option<Command>, String> {
     Ok(Some(match words {
@@ -49,33 +48,46 @@ pub fn parse(words: &[&str]) -> Result<Option<Command>, String> {
             "function" | "fn" => Mode::Function,
             other => return Err(format!("unknown mode '{other}'")),
         }),
-        ["status"] | ["reload"] | ["snapshot", _] | ["debug", "on" | "off"] => return Ok(None),
+        ["status"] | ["controls"] | ["reload"] | ["snapshot", _] | ["debug", "on" | "off"] => {
+            return Ok(None);
+        }
         ["screensaver"] | ["screensaver", _] => return Ok(None),
-        ["haptics", mode] if Haptics::from_command(mode).is_some() => return Ok(None),
+        ["haptics", "on" | "off"] => return Ok(None),
         _ => return Err(format!("unknown command '{}'", words.join(" "))),
     }))
 }
 
 fn handle(stream: UnixStream, bus: &Bus) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut reader = BufReader::new(&stream);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
     }
     let words: Vec<&str> = line.split_whitespace().collect();
+    if words == ["input"] {
+        let bus = bus.clone();
+        thread::Builder::new()
+            .name("control-input".into())
+            .spawn(move || crate::input::serve(reader, bus))
+            .ok();
+        return;
+    }
     let (tx, rx) = mpsc::channel();
     let reply = match words.as_slice() {
-        ["haptics", state] => match Haptics::from_command(state) {
-            Some(mode) => {
-                bus.send(Event::Haptics(mode, tx));
-                rx.recv_timeout(Duration::from_secs(2))
-                    .unwrap_or_else(|_| "error: renderer busy".into())
-            }
-            None => "error: use haptics medium, zoned, on, or off".into(),
-        },
-        ["status"] => {
-            bus.send(Event::Status(tx));
+        ["haptics", state @ ("on" | "off")] => {
+            bus.send(Event::Haptics(*state == "on", tx));
+            rx.recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| "error: renderer busy".into())
+        }
+        ["haptics", _] => "error: use haptics on or off".into(),
+        [command @ ("status" | "controls")] => {
+            bus.send(if *command == "status" {
+                Event::Status(crate::haptics::available(), tx)
+            } else {
+                Event::Controls(tx)
+            });
             rx.recv_timeout(Duration::from_secs(2))
                 .unwrap_or_else(|_| "error: renderer busy".into())
         }
@@ -104,14 +116,13 @@ fn handle(stream: UnixStream, bus: &Bus) {
             Ok(Some(command)) => {
                 bus.send(Event::Control(command, tx));
                 rx.recv_timeout(Duration::from_secs(2))
-                    .unwrap_or_else(|_| "ok".into())
+                    .unwrap_or_else(|_| "error: renderer busy".into())
             }
             Ok(None) => "ok".into(),
             Err(e) => format!("error: {e}"),
         },
     };
-    let mut stream = stream;
-    let _ = writeln!(stream, "{reply}");
+    let _ = writeln!(reader.get_mut(), "{reply}");
 }
 
 pub fn serve(bus: Bus) {
@@ -150,6 +161,25 @@ pub fn client(args: &[String]) -> i32 {
         return 2;
     }
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::input::Gesture::parse(&words) {
+        Ok(Some(gesture)) => {
+            return match gesture.run() {
+                Ok(()) => {
+                    println!("ok");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("omatouchbar: {e}");
+                    1
+                }
+            };
+        }
+        Err(e) => {
+            eprintln!("omatouchbar: {e}");
+            return 2;
+        }
+        Ok(None) => {}
+    }
     if let Err(e) = parse(&words) {
         eprintln!("omatouchbar: {e}");
         return 2;
@@ -168,7 +198,10 @@ pub fn client(args: &[String]) -> i32 {
         return 1;
     }
     let mut reply = String::new();
-    let _ = BufReader::new(&stream).read_line(&mut reply);
+    if BufReader::new(&stream).read_line(&mut reply).unwrap_or(0) == 0 {
+        eprintln!("omatouchbar: no renderer reply");
+        return 1;
+    }
     let reply = reply.trim();
     println!("{reply}");
     if reply.starts_with("error") { 1 } else { 0 }
