@@ -574,7 +574,7 @@ impl Scene {
             bar: fx.bar(&clock, rx + 2.0, right),
         };
 
-        canvas.set_clip(Some(ClipRect { x0: rx, x1: right }));
+        canvas.set_clip(Some(ClipRect::band(rx, right)));
         self.fx_bar_fill(canvas, &hero, &pal, rect, alpha);
         self.fx_field(canvas, fx, &hero, &pal, rect, &clock, alpha);
         self.fx_bar_edge(canvas, &hero, &pal, rect, alpha);
@@ -899,7 +899,7 @@ impl Scene {
             };
             for (a, b) in zones {
                 if b > a + 1.0 {
-                    canvas.set_clip(Some(ClipRect { x0: a, x1: b }));
+                    canvas.set_clip(Some(ClipRect::band(a, b)));
                     canvas.stroke_path_colored(&path, width, color);
                 }
             }

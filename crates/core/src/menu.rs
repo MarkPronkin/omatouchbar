@@ -6,7 +6,7 @@
 //! The user's `~/.config/omarchy/extensions/omarchy-menu.jsonc` may add
 //! entries or override fields of existing ones.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -36,6 +36,13 @@ pub struct MenuItem {
 impl MenuItem {
     pub fn parent(&self) -> &str {
         parent_of(&self.id)
+    }
+
+    /// Static menus and links get their content from the named parent.
+    /// Providers populate their own rows asynchronously.
+    fn static_menu(&self) -> Option<&str> {
+        (self.action.is_none() && self.provider.is_none())
+            .then(|| self.target.as_deref().unwrap_or(&self.id))
     }
 }
 
@@ -304,6 +311,48 @@ impl MenuTree {
             && (item.target.is_some() || self.has_children(&item.id) || item.provider.is_some())
     }
 
+    /// As in Omarchy, a static submenu needs at least one visible descendant.
+    pub(crate) fn is_visible(&self, item: &MenuItem, when: impl Fn(&str) -> bool) -> bool {
+        let mut pending = vec![item];
+        let mut expanded = HashSet::new();
+        while let Some(item) = pending.pop() {
+            if item.when.is_some() && !when(&item.id) {
+                continue;
+            }
+            let Some(id) = item.static_menu() else {
+                return true;
+            };
+            if expanded.insert(id) {
+                pending.extend(self.children(id));
+            }
+        }
+        false
+    }
+
+    /// Only probe descendants when the parent's visibility depends on them.
+    /// A submenu containing an unconditional action can always be entered.
+    pub(crate) fn visibility_guards(&self, parent: &str) -> Vec<(&str, &str)> {
+        let mut guarded = Vec::new();
+        let mut seen = HashSet::new();
+        let mut pending: Vec<_> = self.children(parent).collect();
+        while let Some(item) = pending.pop() {
+            if !seen.insert(&item.id) {
+                continue;
+            }
+            if let Some(expr) = &item.when {
+                guarded.push((item.id.as_str(), expr.as_str()));
+            }
+            if let Some(id) = item.static_menu()
+                && !self
+                    .children(id)
+                    .any(|child| self.is_visible(child, |_| false))
+            {
+                pending.extend(self.children(id));
+            }
+        }
+        guarded
+    }
+
     pub fn title(&self, id: &str) -> String {
         match self.get(id) {
             Some(item) => item.title.clone().unwrap_or_else(|| item.label.clone()),
@@ -343,6 +392,33 @@ pub fn provider_script(name: &str) -> Option<(&'static str, &'static str)> {
         )),
         _ => None,
     }
+}
+
+/// Example choices for provider menus in the interactive preview and snapshots.
+pub fn sample_provider_rows(provider: &str) -> Vec<(String, String, bool)> {
+    let choices: &[(&str, &str)] = match provider {
+        "fonts" => &[
+            ("JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font"),
+            ("Cascadia Code", "Cascadia Code"),
+        ],
+        "power-profiles" => &[
+            ("balanced", "balanced"),
+            ("performance", "performance"),
+            ("power-saver", "power-saver"),
+        ],
+        "kernels" => &[("linux", "linux"), ("linux-lts", "linux-lts")],
+        "languages" => &[
+            ("English", "en_US"),
+            ("Deutsch", "de_DE"),
+            ("Français", "fr_FR"),
+        ],
+        _ => &[],
+    };
+    choices
+        .iter()
+        .enumerate()
+        .map(|(i, &(label, value))| (label.into(), value.into(), i == 0))
+        .collect()
 }
 
 /// Quotes a value for bash.

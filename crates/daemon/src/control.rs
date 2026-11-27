@@ -16,6 +16,7 @@ use omatouchbar_core::{
 };
 
 use crate::bus::{Bus, Event};
+use crate::haptics::Haptics;
 
 pub fn parse(words: &[&str]) -> Result<Option<Command>, String> {
     Ok(Some(match words {
@@ -49,6 +50,8 @@ pub fn parse(words: &[&str]) -> Result<Option<Command>, String> {
             other => return Err(format!("unknown mode '{other}'")),
         }),
         ["status"] | ["reload"] | ["snapshot", _] | ["debug", "on" | "off"] => return Ok(None),
+        ["screensaver"] | ["screensaver", _] => return Ok(None),
+        ["haptics", mode] if Haptics::from_command(mode).is_some() => return Ok(None),
         _ => return Err(format!("unknown command '{}'", words.join(" "))),
     }))
 }
@@ -63,6 +66,14 @@ fn handle(stream: UnixStream, bus: &Bus) {
     let words: Vec<&str> = line.split_whitespace().collect();
     let (tx, rx) = mpsc::channel();
     let reply = match words.as_slice() {
+        ["haptics", state] => match Haptics::from_command(state) {
+            Some(mode) => {
+                bus.send(Event::Haptics(mode, tx));
+                rx.recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_else(|_| "error: renderer busy".into())
+            }
+            None => "error: use haptics medium, zoned, on, or off".into(),
+        },
         ["status"] => {
             bus.send(Event::Status(tx));
             rx.recv_timeout(Duration::from_secs(2))
@@ -75,6 +86,14 @@ fn handle(stream: UnixStream, bus: &Bus) {
         ["debug", state] => {
             bus.send(Event::Debug(*state == "on"));
             "ok".into()
+        }
+        ["screensaver", rest @ ..] if rest.len() <= 1 => {
+            bus.send(Event::ScreensaverDemo(
+                rest.first().map(|s| s.to_string()),
+                tx,
+            ));
+            rx.recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| "error: renderer busy".into())
         }
         ["snapshot", path] => {
             bus.send(Event::Snapshot(path.to_string(), tx));

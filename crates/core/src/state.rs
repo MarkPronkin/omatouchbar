@@ -711,6 +711,16 @@ pub struct DesktopState {
 impl DesktopState {
     /// Plausible data for previews and snapshots.
     pub fn sample() -> DesktopState {
+        Self::sample_for_model("MacBookPro14,3")
+    }
+
+    /// The demo Display panel uses the built-in Retina screen of the host.
+    /// Both chassis have the same Touch Bar pixel dimensions.
+    pub fn sample_for_model(model: &str) -> DesktopState {
+        let (width, height) = match model.trim() {
+            "MacBookPro13,2" | "MacBookPro14,2" => (2560, 1600),
+            _ => (2880, 1800),
+        };
         let ws = |id: i32, windows: u32| Workspace {
             id,
             name: id.to_string(),
@@ -822,15 +832,19 @@ impl DesktopState {
                         name: "eDP-1".into(),
                         enabled: true,
                         focused: true,
-                        width: 2880,
-                        height: 1800,
+                        width,
+                        height,
+                        make: "Apple Computer Inc".into(),
+                        model: "Color LCD".into(),
                     },
                     crate::display::Monitor {
                         name: "DP-1".into(),
                         enabled: false,
                         focused: false,
-                        width: 1920,
-                        height: 1080,
+                        width: 3840,
+                        height: 2160,
+                        make: "LG Electronics".into(),
+                        model: "LG ULTRAFINE".into(),
                     },
                 ],
                 brightness: Some(70),

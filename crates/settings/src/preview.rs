@@ -56,7 +56,8 @@ fn new_scene(config: Config, palette: Palette) -> Scene {
         MenuTree::load(),
         BarLayout::from_omarchy(),
     );
-    scene.set_state(DesktopState::sample());
+    let model = std::fs::read_to_string("/sys/class/dmi/id/product_name").unwrap_or_default();
+    scene.set_state(DesktopState::sample_for_model(&model));
     scene
 }
 
@@ -185,6 +186,30 @@ impl Preview {
         i.dirty = true;
     }
 
+    /// The config the preview is showing (which the tour may vary).
+    pub fn config(&self) -> Config {
+        self.inner.borrow().scene.config().clone()
+    }
+
+    pub fn picture(&self) -> gtk::Picture {
+        self.picture.clone()
+    }
+
+    /// Moves the preview into `slot`, wherever it was before.
+    pub fn place(&self, slot: &gtk::Box) {
+        if self.widget.parent().as_ref() == Some(slot.upcast_ref()) {
+            return;
+        }
+        if let Some(parent) = self.widget.parent() {
+            if let Some(parent) = parent.downcast_ref::<gtk::Box>() {
+                parent.remove(&self.widget);
+            } else {
+                self.widget.unparent();
+            }
+        }
+        slot.append(&self.widget);
+    }
+
     pub fn set_palette(&self, palette: Palette) {
         self.inner.borrow_mut().scene.set_palette(palette);
     }
@@ -243,7 +268,6 @@ impl Preview {
         let palette = Palette::load().unwrap_or_else(Palette::fallback);
         i.scene = new_scene(config, palette);
         i.dirty = true;
-        let _ = &self.picture;
     }
 }
 
@@ -580,6 +604,10 @@ fn simulate(inner: &mut Inner, action: Action, toasts: &adw::ToastOverlay) {
                 checked: false,
             }],
         ),
+        Action::LoadProvider { menu, provider } => {
+            let rows = omatouchbar_core::menu::sample_provider_rows(&provider);
+            scene.apply_provider(&menu, &provider, rows);
+        }
         Action::ActivateTray { .. } | Action::ClickTrayMenu { .. } => toasts.add_toast(
             adw::Toast::builder()
                 .title("Would activate the tray item")

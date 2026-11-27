@@ -38,6 +38,7 @@ pub struct Refresh {
 }
 
 pub struct Exec {
+    pub haptics: crate::haptics::Player,
     children: Vec<Child>,
     world: omatouchbar_core::world_clock::Worker,
     pub weather: weather::Provider,
@@ -46,6 +47,8 @@ pub struct Exec {
     pub wifi: wifi::WifiConnector,
     pub speedtest: speedtest::SpeedTestRunner,
     pub bluetooth_scan: dbus::BluetoothScan,
+    /// Omarchy's screensaver on the strip.
+    pub screensaver: crate::screensaver::Mirror,
     bus: Bus,
     /// The PipeWire sink Omarchy's volume commands control.
     pub sink: Arc<Mutex<Option<String>>>,
@@ -53,8 +56,10 @@ pub struct Exec {
 }
 
 impl Exec {
-    pub fn new(bus: Bus) -> Exec {
+    pub fn new(bus: Bus, size: (u32, u32)) -> Exec {
         Exec {
+            haptics: crate::haptics::Player::new(),
+            screensaver: crate::screensaver::Mirror::new(bus.clone(), size),
             children: Vec::new(),
             world: {
                 let bus = bus.clone();
@@ -406,6 +411,7 @@ impl Exec {
                     let _ = client.cancel_touch_id();
                 }
             }
+            Action::DismissScreensaver => self.screensaver.dismiss(),
             Action::EvaluateGuards { menu, guards } => self.evaluate_guards(menu, guards),
             Action::LoadProvider { menu, provider } => self.load_provider(menu, provider),
             Action::PanelOpened(panel) => {

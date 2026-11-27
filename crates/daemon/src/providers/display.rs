@@ -1,5 +1,6 @@
-//! Omarchy's Display panel. Monitor/DDC reads run only while the panel is
-//! visible. A single worker orders writes, including the last-screen check.
+//! Omarchy's Display panel. Monitor/DDC reads run once at startup, then
+//! only while the panel is visible; the last reading stays in between. A
+//! single worker orders writes, including the last-screen check.
 
 use std::{
     path::Path,
@@ -84,8 +85,22 @@ fn read_monitors() -> Option<DisplayPanel> {
     monitor_state(&desktop_output("omarchy-monitor-state", &[])?)
 }
 
+/// Names each screen by its maker and model, read straight from Hyprland's
+/// socket (Omarchy's state helper only reports connectors).
+fn name_monitors(panel: &mut DisplayPanel, models: Vec<(String, String, String)>) {
+    for (name, make, model) in models {
+        if let Some(monitor) = panel.monitors.iter_mut().find(|m| m.name == name) {
+            monitor.make = make;
+            monitor.model = model;
+        }
+    }
+}
+
 fn read_panel() -> DisplayPanel {
     let mut panel = read_monitors().unwrap_or_default();
+    if panel.monitors.len() > 1 || panel.monitors.iter().any(|m| !m.internal()) {
+        name_monitors(&mut panel, super::hyprland::monitor_models());
+    }
     panel.text_size = base_size(&paths::config_home().join("omarchy/shell.toml"))
         .or_else(|| base_size(&paths::state_home().join("omarchy/current/theme/shell.toml")))
         .unwrap_or(12);
@@ -146,6 +161,11 @@ impl Request {
 }
 
 fn watch(bus: Bus, rx: mpsc::Receiver<Request>) {
+    // Read once up front and keep the last reading while the panel is
+    // closed: the panel then opens complete, like Sound and Network, and
+    // refreshes in place instead of reflowing mid-animation.
+    let panel = read_panel();
+    bus.patch(move |s| s.display_panel = Some(panel));
     let mut visible = false;
     let mut interval = Duration::ZERO;
     loop {
@@ -178,12 +198,7 @@ fn watch(bus: Bus, rx: mpsc::Receiver<Request>) {
             };
             match request {
                 Request::Change(change, osd) => apply(change, osd),
-                Request::Visible(next) => {
-                    visible = next;
-                    if !visible {
-                        bus.patch(|s| s.display_panel = None);
-                    }
-                }
+                Request::Visible(next) => visible = next,
             }
         }
     }
@@ -235,5 +250,20 @@ mod tests {
             Some(38)
         );
         assert!(monitor_state("38\neDP-1\n").is_none());
+
+        let mut panel = monitor_state(raw).unwrap();
+        name_monitors(
+            &mut panel,
+            vec![
+                ("HDMI-A-1".into(), "Dell Inc.".into(), "DELL U2720Q".into()),
+                (
+                    "DP-9".into(),
+                    "LG Electronics".into(),
+                    "LG ULTRAFINE".into(),
+                ),
+            ],
+        );
+        assert_eq!(panel.monitors[0].label(), "Built-in Display");
+        assert_eq!(panel.focused().unwrap().label(), "DELL U2720Q");
     }
 }

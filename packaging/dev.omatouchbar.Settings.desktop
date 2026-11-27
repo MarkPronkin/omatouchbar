@@ -9,5 +9,5 @@ Terminal=false
 NoDisplay=true
 Categories=Settings;HardwareSettings;
 Keywords=touchbar;touch bar;t1;macbook;omarchy;bar;
-StartupNotify=true
+StartupNotify=false
 StartupWMClass=dev.omatouchbar.Settings

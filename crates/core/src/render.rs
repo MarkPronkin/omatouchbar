@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use crate::{
     anim::{Animated, Ripple},
-    canvas::{Canvas, ClipRect},
+    canvas::{Canvas, ClipRect, VAlign},
+    color::Rgba,
     node::{Anchor, Key, Node, Part},
     scene::Scene,
     text::Role,
@@ -13,6 +14,47 @@ use crate::{
 
 fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// One key's share of a `Level`: a fill in the key's own shape from its
+/// left up to the value, as a slider fills. It rises out of the key's
+/// bottom edge as it shows and sinks back as it hides (`shown`), level
+/// like liquid, so it never blends into the key half-faded. Returns where
+/// the fill ends across and how high it reaches, for the key's `SplitText`.
+fn draw_level(
+    canvas: &mut Canvas,
+    (x, y, w, h, r): (f32, f32, f32, f32, f32),
+    value: f32,
+    (from, to): (f32, f32),
+    color: Rgba,
+    (shown, opacity): (f32, f32),
+) -> (f32, f32) {
+    let local = ((value - from) / (to - from).max(1e-4)).clamp(0.0, 1.0);
+    let edge = x + w * local;
+    // Gone a touch before the spring settles, so no sliver lingers.
+    let rise = ((shown - 0.1) / 0.9).clamp(0.0, 1.0);
+    let top = y + h * (1.0 - rise);
+    let prev = canvas.clip();
+    let outer = prev.unwrap_or(ClipRect::band(0.0, canvas.width() as f32));
+    let clip = ClipRect {
+        x1: edge.min(outer.x1),
+        y0: top.max(outer.y0),
+        ..outer
+    };
+    if clip.x1 - clip.x0 >= 0.5 && clip.y1 - clip.y0 >= 0.5 {
+        canvas.set_clip(Some(clip));
+        canvas.fill_rrect_vgradient(
+            x,
+            y,
+            w,
+            h,
+            r,
+            color.lighten(0.08).fade(opacity),
+            color.fade(opacity),
+        );
+        canvas.set_clip(prev);
+    }
+    (edge, top)
 }
 
 impl Scene {
@@ -33,10 +75,7 @@ impl Scene {
     /// layout built in another theme) where it has one.
     fn render_pass(&self, canvas: &mut Canvas, t: &Theme, nodes: Option<&HashMap<Key, Node>>) {
         canvas.clear(t.bar);
-        let row = (self.scroll.x0 < self.scroll.x1).then_some(ClipRect {
-            x0: self.scroll.x0,
-            x1: self.scroll.x1,
-        });
+        let row = self.scroll.clip();
         for a in &self.animator.items {
             let offset = if a.node.group == Some(0) {
                 self.scroll.offset
@@ -108,6 +147,10 @@ impl Scene {
             }
         }
 
+        // Where this node's Progress or Level fill ends (and, for a
+        // rising Level, how high it reaches), for SplitText.
+        let mut fill_edge = x;
+        let mut fill_top = f32::NEG_INFINITY;
         for part in &node.parts {
             match part {
                 Part::Text {
@@ -125,30 +168,57 @@ impl Scene {
                         Some(e) => color.mix(*e, emph),
                         None => *color,
                     };
-                    // Text keeps its size while the node scales (entering,
-                    // leaving, pressed): only its place follows the card.
-                    // Scaling it would step through whole-pixel sizes and
-                    // visibly pop, and would miss the glyph cache.
-                    let size = *size;
-                    let run = self.fonts.layout(text, size, *role);
-                    let tx = match anchor {
-                        Anchor::Start => x + dx * scale,
-                        Anchor::Center if matches!(role, Role::Icon | Role::Logo) => {
-                            let (l, r) = self.fonts.ink_hbounds(text, size, *role);
-                            x + w / 2.0 - (l + r) / 2.0 + dx * scale
-                        }
-                        Anchor::Center => x + (w - run.width) / 2.0 + dx * scale,
-                        Anchor::End => x + w - dx * scale - run.width,
+                    let place = (x, y, w, h, scale);
+                    let text = (text.as_str(), *size, *role, *anchor, *dx, *dy, *valign);
+                    self.draw_text(canvas, text, place, color.fade(opacity));
+                }
+                Part::SplitText {
+                    text,
+                    size,
+                    role,
+                    color,
+                    on_fill,
+                    anchor,
+                    dx,
+                } => {
+                    let valign = if matches!(role, Role::Icon | Role::Logo) {
+                        VAlign::Ink
+                    } else {
+                        VAlign::Cap
                     };
-                    canvas.draw_run(
-                        &self.fonts,
-                        &run,
-                        tx,
-                        // Unscaled, so the rounded baseline can't hop a pixel.
-                        y + h / 2.0 + dy,
-                        color.fade(opacity),
-                        *valign,
-                    );
+                    let place = (x, y, w, h, scale);
+                    let text = (text.as_str(), *size, *role, *anchor, *dx, 0.0, valign);
+                    let prev = canvas.clip();
+                    let outer = prev.unwrap_or(ClipRect::band(0.0, canvas.width() as f32));
+                    let edge = fill_edge.clamp(outer.x0, outer.x1);
+                    let top = fill_top.clamp(outer.y0, outer.y1);
+                    // On the fill, above a rising fill, and past its edge.
+                    for (clip, color) in [
+                        (
+                            ClipRect {
+                                x1: edge,
+                                y0: top,
+                                ..outer
+                            },
+                            on_fill,
+                        ),
+                        (
+                            ClipRect {
+                                x1: edge,
+                                y1: top,
+                                ..outer
+                            },
+                            color,
+                        ),
+                        (ClipRect { x0: edge, ..outer }, color),
+                    ] {
+                        let rows = clip.y0.max(y) < clip.y1.min(y + h);
+                        if clip.x1 - clip.x0 >= 0.5 && rows {
+                            canvas.set_clip(Some(clip));
+                            self.draw_text(canvas, text, place, color.fade(opacity));
+                        }
+                    }
+                    canvas.set_clip(prev);
                 }
                 Part::ClockTrack {
                     value,
@@ -209,6 +279,7 @@ impl Scene {
                         opacity
                     };
                     if fw > 0.5 && fade > 0.004 {
+                        fill_edge = px + fw;
                         canvas.fill_rrect_vgradient(
                             px,
                             py,
@@ -219,6 +290,14 @@ impl Scene {
                             color.fade(fade),
                         );
                     }
+                }
+                Part::Level { span, color, .. } => {
+                    let shown = a.level.value.clamp(0.0, 1.0);
+                    let r = node.fill.as_ref().map_or(0.0, |f| f.radius) * scale.min(1.0);
+                    let value = a.progress.value.clamp(0.0, 1.0);
+                    let place = (x, y, w, h, r);
+                    let show = (shown, opacity);
+                    (fill_edge, fill_top) = draw_level(canvas, place, value, *span, *color, show);
                 }
                 Part::Dot {
                     anchor,
@@ -271,11 +350,16 @@ impl Scene {
                     let t = (elapsed * 0.85).fract();
                     let band_w = (w * 0.32).clamp(120.0, 280.0);
                     let sx = x - band_w + (w + band_w * 2.0) * t;
-                    let prev_clip = Some(ClipRect {
-                        x0: x + 2.0,
-                        x1: x + w - 2.0,
-                    });
-                    canvas.set_clip(prev_clip);
+                    let prev_clip = canvas.clip();
+                    let mut clip = ClipRect::band(x + 2.0, x + w - 2.0);
+                    if let Some(row) = prev_clip {
+                        clip.x0 = clip.x0.max(row.x0);
+                        clip.x1 = clip.x1.min(row.x1);
+                    }
+                    if clip.x0 >= clip.x1 {
+                        continue;
+                    }
+                    canvas.set_clip(Some(clip));
                     canvas.fill_rrect_hgradient(
                         sx,
                         y + 2.0,
@@ -303,11 +387,53 @@ impl Scene {
                             (1.0, color.alpha(0.0)),
                         ],
                     );
-                    canvas.set_clip(None);
+                    canvas.set_clip(prev_clip);
                 }
                 Part::TouchFx => self.draw_touch_fx(canvas, (x, y, w, h), t, opacity),
+                Part::Screensaver => {
+                    // The desktop's screensaver terminal is black.
+                    canvas.blend_rect(x, y, w, h, Rgba::BLACK.alpha(opacity));
+                    if let Some(saver) = &self.saver
+                        && let Some(frame) = &saver.frame
+                    {
+                        crate::screensaver::draw(
+                            canvas,
+                            frame,
+                            &saver.geometry,
+                            &saver.glyphs,
+                            &self.fonts,
+                            opacity,
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// One run of text placed on a node. Text keeps its size while the node
+    /// scales (entering, leaving, pressed): only its place follows the card.
+    /// Scaling it would step through whole-pixel sizes and visibly pop, and
+    /// would miss the glyph cache.
+    #[allow(clippy::type_complexity)]
+    fn draw_text(
+        &self,
+        canvas: &mut Canvas,
+        (text, size, role, anchor, dx, dy, valign): (&str, f32, Role, Anchor, f32, f32, VAlign),
+        (x, y, w, h, scale): (f32, f32, f32, f32, f32),
+        color: Rgba,
+    ) {
+        let run = self.fonts.layout(text, size, role);
+        let tx = match anchor {
+            Anchor::Start => x + dx * scale,
+            Anchor::Center if matches!(role, Role::Icon | Role::Logo) => {
+                let (l, r) = self.fonts.ink_hbounds(text, size, role);
+                x + w / 2.0 - (l + r) / 2.0 + dx * scale
+            }
+            Anchor::Center => x + (w - run.width) / 2.0 + dx * scale,
+            Anchor::End => x + w - dx * scale - run.width,
+        };
+        // Unscaled, so the rounded baseline can't hop a pixel.
+        canvas.draw_run(&self.fonts, &run, tx, y + h / 2.0 + dy, color, valign);
     }
 
     fn ripple(

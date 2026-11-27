@@ -16,6 +16,7 @@ pub mod omarchy;
 pub mod paths;
 mod render;
 pub mod scene;
+pub mod screensaver;
 pub mod speedtest;
 pub mod state;
 pub mod text;

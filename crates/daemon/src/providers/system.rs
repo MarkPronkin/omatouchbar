@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use omatouchbar_core::{
@@ -292,6 +292,7 @@ pub fn spawn_brightness(bus: Bus) -> mpsc::Sender<()> {
         .spawn(move || {
             let (display, keyboard) = backlights();
             let mut last = (None, None);
+            let mut fast_until = Instant::now();
             loop {
                 let now = (
                     display.as_deref().and_then(percent),
@@ -302,28 +303,27 @@ pub fn spawn_brightness(bus: Bus) -> mpsc::Sender<()> {
                     bus.patch(move |s| {
                         s.display_brightness = now.0;
                         s.keyboard_backlight = now.1;
+                        // The Display panel keeps its last reading while
+                        // closed; brightness keys move the laptop panel.
+                        if let (Some(level), Some(panel)) = (now.0, s.display_panel.as_mut())
+                            && panel.brightness.is_some()
+                            && panel.focused().is_some_and(|m| m.internal())
+                        {
+                            panel.brightness = Some(level);
+                        }
                     });
                 }
-                // Brightness keys change sysfs without events; poll gently,
-                // faster right after a nudge.
-                match rx.recv_timeout(Duration::from_millis(1500)) {
+                // Sysfs has no change event here. Sample between the 90 ms
+                // key repeats so the meter and tick follow the actual step.
+                let interval = if Instant::now() < fast_until {
+                    Duration::from_millis(35)
+                } else {
+                    Duration::from_millis(1500)
+                };
+                match rx.recv_timeout(interval) {
                     Ok(()) => {
                         while rx.try_recv().is_ok() {}
-                        for _ in 0..6 {
-                            thread::sleep(Duration::from_millis(120));
-                            while rx.try_recv().is_ok() {}
-                            let now = (
-                                display.as_deref().and_then(percent),
-                                keyboard.as_deref().and_then(percent),
-                            );
-                            if now != last {
-                                last = now;
-                                bus.patch(move |s| {
-                                    s.display_brightness = now.0;
-                                    s.keyboard_backlight = now.1;
-                                });
-                            }
-                        }
+                        fast_until = Instant::now() + Duration::from_millis(720);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,

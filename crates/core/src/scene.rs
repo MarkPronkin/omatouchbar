@@ -7,18 +7,21 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 
 use crate::{
-    anim::{Animator, Feel, Spring, SpringParams},
+    anim::{Animated, Animator, Feel, Spring, SpringParams},
+    canvas::ClipRect,
     config::{Config, FnKey, Mode},
     display::DisplayChange,
     menu::{self, MenuItem, MenuTree},
     node::{HitKind, Key, Motion, Rect},
     omarchy::BarLayout,
+    screensaver::{Geometry, Grid, Saver},
     speedtest::{SpeedTestEvent, SpeedTestState},
     state::{
         BtOp, DesktopState, DnsProvider, Indicator, NetKind, TouchId, TouchIdStage, TrayMenuEntry,
@@ -206,6 +209,9 @@ pub enum Action {
     /// Clear all queued Omarchy reminders.
     ClearReminders,
     CancelTouchId,
+    /// The strip was touched during Omarchy's screensaver: end it on the
+    /// desktop too.
+    DismissScreensaver,
     /// Evaluate the menu's `when`/`checked`/`disabled` shell conditions.
     EvaluateGuards {
         menu: String,
@@ -300,6 +306,43 @@ pub enum Slider {
     Mic,
     /// One app's playback volume (sink-input index).
     Stream(u32),
+}
+
+impl Slider {
+    fn minimum_percent(self) -> u8 {
+        match self {
+            Self::Monitor(_) => 1,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelFeedback {
+    SliderOpened,
+    Tick,
+    Minimum,
+    Maximum,
+}
+
+impl LevelFeedback {
+    fn at(percent: u8, minimum: u8) -> Self {
+        match percent {
+            p if p == minimum => Self::Minimum,
+            100 => Self::Maximum,
+            _ => Self::Tick,
+        }
+    }
+
+    // One actuator plays one cue per frame. Limits take priority over the
+    // opening click, which takes priority over ordinary adjustment ticks.
+    fn queue(self, pending: &mut Option<Self>) {
+        match self {
+            Self::Tick if pending.is_some() => {}
+            Self::SliderOpened if matches!(pending, Some(Self::Minimum | Self::Maximum)) => {}
+            _ => *pending = Some(self),
+        }
+    }
 }
 
 /// The Sound panel's sections, as in Omarchy's audio panel.
@@ -466,6 +509,8 @@ struct Touch {
     last_t: Instant,
     vx: f32,
     repeat_at: Option<Instant>,
+    /// Last confirmed percentage since this key started repeating.
+    repeat_level: Option<u8>,
     hold_at: Option<Instant>,
     swallowed: bool,
 }
@@ -481,6 +526,10 @@ pub(crate) struct Scroll {
 }
 
 impl Scroll {
+    pub(crate) fn clip(&self) -> Option<ClipRect> {
+        (self.x0 < self.x1).then_some(ClipRect::band(self.x0, self.x1))
+    }
+
     fn step(&mut self, dt: f32) -> bool {
         if self.dragging {
             return false;
@@ -586,6 +635,7 @@ pub struct Scene {
     pub(crate) guards: HashMap<String, GuardResult>,
     pub(crate) provider_rows: HashMap<String, Vec<MenuItem>>,
     actions: Vec<Action>,
+    level_feedback: Option<LevelFeedback>,
     dirty: bool,
     last_update: Option<Instant>,
     pub(crate) now: Instant,
@@ -605,6 +655,8 @@ pub struct Scene {
     pub(crate) touch_fx: Option<TouchFx>,
     /// A scripted prompt and when it started (set on the next update).
     touch_demo: Option<(TouchIdDemo, Option<Instant>)>,
+    /// Omarchy's screensaver, while it runs (see `screensaver`).
+    pub(crate) saver: Option<Saver>,
     animating: bool,
 }
 
@@ -678,6 +730,7 @@ impl Scene {
             guards: HashMap::new(),
             provider_rows: HashMap::new(),
             actions: Vec::new(),
+            level_feedback: None,
             dirty: true,
             last_update: None,
             now,
@@ -695,6 +748,7 @@ impl Scene {
             entered_at: now,
             touch_fx: None,
             touch_demo: None,
+            saver: None,
             animating: true,
         };
         scene.animator.enter = Motion::rise(10.0);
@@ -1485,6 +1539,50 @@ impl Scene {
         std::mem::take(&mut self.actions)
     }
 
+    pub fn take_level_feedback(&mut self) -> Option<LevelFeedback> {
+        self.level_feedback.take()
+    }
+
+    // ----------------------------------------------------------- screensaver
+
+    /// Omarchy's screensaver started: the strip becomes its canvas, divided
+    /// as `geometry`, and shows the frames [`Scene::screensaver_frame`]
+    /// hands it until [`Scene::screensaver_stop`] or a touch. Touch ID
+    /// prompts still take over.
+    pub fn screensaver_start(&mut self, geometry: Geometry) {
+        if self.saver.as_ref().is_some_and(|s| s.geometry == geometry) {
+            return;
+        }
+        self.finish_quick_slider();
+        self.saver = Some(Saver::new(geometry));
+        self.dirty = true;
+    }
+
+    /// The effect's latest frame (ignored unless the screensaver is up).
+    pub fn screensaver_frame(&mut self, grid: Arc<Grid>) {
+        if let Some(saver) = self.saver.as_mut() {
+            saver.frame = Some(grid);
+            saver.fresh = true;
+        }
+    }
+
+    /// The screensaver ended on the desktop: someone is back.
+    pub fn screensaver_stop(&mut self) {
+        if self.saver.take().is_some() {
+            self.wake();
+            self.last_touch = self.last_touch.max(self.now);
+        }
+    }
+
+    pub fn screensaver_active(&self) -> bool {
+        self.saver.is_some()
+    }
+
+    /// Whether the screensaver owns the strip right now.
+    pub(crate) fn shows_screensaver(&self) -> bool {
+        self.saver.is_some() && self.touch_fx.is_none()
+    }
+
     /// Glyphs in the font cache (diagnostics).
     pub fn cached_glyphs(&self) -> usize {
         self.fonts.cached_glyphs()
@@ -1498,8 +1596,21 @@ impl Scene {
     // ---------------------------------------------------------------- touch
 
     /// Feeds one input frame: every contact currently touching, in display
-    /// coordinates.
-    pub fn input(&mut self, fn_pressed: bool, contacts: &[(u8, f32, f32)], now: Instant) {
+    /// coordinates. Returns true when a new contact presses a button.
+    pub fn input(&mut self, fn_pressed: bool, contacts: &[(u8, f32, f32)], now: Instant) -> bool {
+        self.input_press_position(fn_pressed, contacts, now)
+            .is_some()
+    }
+
+    /// Processes a frame and returns the first new button press's horizontal
+    /// position, from 0 (left edge) to 1 (right edge). A single actuator can
+    /// play only one click when several fingers land in the same frame.
+    pub fn input_press_position(
+        &mut self,
+        fn_pressed: bool,
+        contacts: &[(u8, f32, f32)],
+        now: Instant,
+    ) -> Option<f32> {
         self.now = now;
         if !contacts.is_empty() {
             self.bt.active_at = Some(now);
@@ -1528,13 +1639,15 @@ impl Scene {
         for id in ended {
             self.touch_up(id, now);
         }
+        let mut press_position = None;
         for &(id, x, y) in contacts {
             if self.touches.contains_key(&id) {
                 self.touch_move(id, x, y, now);
-            } else {
-                self.touch_down(id, x, y, now);
+            } else if self.touch_down(id, x, y, now) && press_position.is_none() {
+                press_position = Some((x / self.width).clamp(0.0, 1.0));
             }
         }
+        press_position
     }
 
     fn group_offset(&self, group: Option<u8>) -> f32 {
@@ -1544,7 +1657,36 @@ impl Scene {
         }
     }
 
-    fn touch_down(&mut self, id: u8, x: f32, y: f32, now: Instant) {
+    fn hit_test(&self, x: f32, y: f32, pad: f32) -> Option<Key> {
+        self.animator
+            .hit_test_visible(x, y, pad, |a| self.touch_rect(a, x))
+    }
+
+    fn touch_rect(&self, a: &Animated, x: f32) -> Option<Rect> {
+        let rect = a.rect().offset(-self.group_offset(a.node.group));
+        if a.node.group == Some(0)
+            && let Some(row) = self.scroll.clip()
+        {
+            // Items scrolled behind pinned controls cannot receive their taps.
+            if !(row.x0..row.x1).contains(&x) {
+                return None;
+            }
+            let left = rect.x.max(row.x0);
+            let right = rect.right().min(row.x1);
+            return (left < right).then(|| Rect::new(left, rect.y, right - left, rect.h));
+        }
+        Some(rect)
+    }
+
+    fn still_over(&self, key: Key, x: f32, y: f32) -> bool {
+        self.animator
+            .get(key)
+            .filter(|a| a.node.hit.is_some())
+            .and_then(|a| self.touch_rect(a, x))
+            .is_some_and(|rect| rect.contains(x, y, 28.0))
+    }
+
+    fn touch_down(&mut self, id: u8, x: f32, y: f32, now: Instant) -> bool {
         let was_off = self.brightness.value < 0.08 && self.brightness.target < 0.08;
         self.last_touch = now;
         self.dirty = true;
@@ -1562,12 +1704,20 @@ impl Scene {
             last_t: now,
             vx: 0.0,
             repeat_at: None,
+            repeat_level: None,
             hold_at: None,
             swallowed: was_off,
         };
-        if was_off {
+        // A touch ends the screensaver (on the desktop too) and goes no
+        // further, like a key press on the desktop.
+        if self.shows_screensaver() {
+            touch.swallowed = true;
+            self.saver = None;
+            self.actions.push(Action::DismissScreensaver);
+        }
+        if touch.swallowed {
             self.touches.insert(id, touch);
-            return;
+            return false;
         }
         // Catch a flinging row.
         if self.scroll.velocity.abs() > 40.0 && x >= self.scroll.x0 && x <= self.scroll.x1 {
@@ -1576,12 +1726,9 @@ impl Scene {
             touch.scrolling = true;
             touch.scroll0 = self.scroll.offset;
             self.touches.insert(id, touch);
-            return;
+            return false;
         }
-        let scroll = self.scroll.offset;
-        let key = self
-            .animator
-            .hit_test(x, y, &|g| if g == Some(0) { scroll } else { 0.0 }, 10.0);
+        let key = self.hit_test(x, y, 10.0);
         if let Some(key) = key {
             let (hit, ripple) = match self.animator.get(key) {
                 Some(a) => (
@@ -1599,7 +1746,7 @@ impl Scene {
                 touch.kind = Some(hit.kind);
                 touch.cmd = Some(hit.cmd.clone());
                 match hit.kind {
-                    HitKind::Down | HitKind::Scrub => self.exec(hit.cmd),
+                    HitKind::Down | HitKind::Scrub(_) => self.exec(hit.cmd),
                     HitKind::Repeat => {
                         self.exec(hit.cmd);
                         touch.repeat_at = Some(now + REPEAT_DELAY);
@@ -1620,7 +1767,18 @@ impl Scene {
                 }
             }
         }
+        let button_pressed = matches!(
+            touch.kind,
+            Some(
+                HitKind::Down
+                    | HitKind::Repeat
+                    | HitKind::Tap
+                    | HitKind::TapSlide(_)
+                    | HitKind::Scrub(_)
+            )
+        );
         self.touches.insert(id, touch);
+        button_pressed
     }
 
     fn touch_move(&mut self, id: u8, x: f32, y: f32, now: Instant) {
@@ -1667,21 +1825,12 @@ impl Scene {
                         if let Some(key) = touch.key {
                             self.activate_quick_slider(id, slider, key, touch.x0, Some(x), now);
                         }
-                    } else if let Some(key) = touch.key {
-                        let inside = self
-                            .animator
-                            .get(key)
-                            .map(|a| {
-                                a.rect()
-                                    .offset(-self.group_offset(a.node.group))
-                                    .contains(x, y, 28.0)
-                            })
-                            .unwrap_or(false);
-                        if !inside {
-                            touch.cancelled = true;
-                            touch.hold_at = None;
-                            self.animator.press(key, false, None, false);
-                        }
+                    } else if let Some(key) = touch.key
+                        && !self.still_over(key, x, y)
+                    {
+                        touch.cancelled = true;
+                        touch.hold_at = None;
+                        self.animator.press(key, false, None, false);
                     }
                 }
             }
@@ -1690,25 +1839,20 @@ impl Scene {
                     self.slide(slider, key, x, now, false);
                 }
             }
-            Some(HitKind::Scrub) => {
-                let scroll = self.scroll.offset;
-                if let Some(key) = self.animator.hit_test(
-                    x,
-                    y.clamp(1.0, self.height - 1.0),
-                    &|g| if g == Some(0) { scroll } else { 0.0 },
-                    6.0,
-                ) && Some(key) != touch.key
+            Some(HitKind::Scrub(_)) => {
+                if let Some(key) = self.hit_test(x, y.clamp(1.0, self.height - 1.0), 6.0)
+                    && Some(key) != touch.key
+                    && let Some(hit) = self.animator.get(key).and_then(|a| a.node.hit.clone())
+                    && let HitKind::Scrub(cue) = hit.kind
                 {
-                    let hit = self.animator.get(key).and_then(|a| a.node.hit.clone());
-                    if let Some(hit) = hit.filter(|h| h.kind == HitKind::Scrub) {
-                        if let Some(old) = touch.key {
-                            self.animator.press(old, false, None, false);
-                        }
-                        self.animator.press(key, true, None, false);
-                        touch.key = Some(key);
-                        touch.cmd = Some(hit.cmd.clone());
-                        self.exec(hit.cmd);
+                    if let Some(old) = touch.key {
+                        self.animator.press(old, false, None, false);
                     }
+                    self.animator.press(key, true, None, false);
+                    touch.key = Some(key);
+                    touch.cmd = Some(hit.cmd.clone());
+                    self.exec(hit.cmd);
+                    cue.queue(&mut self.level_feedback);
                 }
             }
             _ => {
@@ -1728,21 +1872,13 @@ impl Scene {
                         self.animator.press(key, false, None, false);
                     }
                     self.scroll.offset = self.scroll.rubber(touch.scroll0 - (x - touch.x0));
-                } else if let Some(key) = touch.key {
-                    let inside = self
-                        .animator
-                        .get(key)
-                        .map(|a| {
-                            a.rect()
-                                .offset(-self.group_offset(a.node.group))
-                                .contains(x, y, 28.0)
-                        })
-                        .unwrap_or(false);
-                    if !inside && !touch.cancelled {
-                        touch.cancelled = true;
-                        touch.repeat_at = None;
-                        self.animator.press(key, false, None, false);
-                    }
+                } else if let Some(key) = touch.key
+                    && !touch.cancelled
+                    && !self.still_over(key, x, y)
+                {
+                    touch.cancelled = true;
+                    touch.repeat_at = None;
+                    self.animator.press(key, false, None, false);
                 }
             }
         }
@@ -1784,16 +1920,10 @@ impl Scene {
         }
         match (touch.kind, touch.cmd) {
             (Some(HitKind::Tap | HitKind::TapSlide(_)), Some(cmd)) if !touch.cancelled => {
-                let inside = touch
+                if touch
                     .key
-                    .and_then(|k| self.animator.get(k))
-                    .map(|a| {
-                        a.rect()
-                            .offset(-self.group_offset(a.node.group))
-                            .contains(touch.x, touch.y, 28.0)
-                    })
-                    .unwrap_or(true);
-                if inside {
+                    .is_some_and(|key| self.still_over(key, touch.x, touch.y))
+                {
                     self.exec(cmd);
                 }
             }
@@ -1827,17 +1957,14 @@ impl Scene {
         let rect = a.rect().offset(-self.group_offset(a.node.group));
         let inset = 6.0;
         let fraction = ((x - rect.x - inset) / (rect.w - inset * 2.0)).clamp(0.0, 1.0);
-        let mut value = (fraction * 100.0).round() as u8;
-        if let Slider::Monitor(target) = slider {
-            if monitor_target(&self.state, target).is_none() {
-                self.overrides.remove(&slider);
-                return;
-            }
-            value = value.max(1);
+        if let Slider::Monitor(target) = slider
+            && monitor_target(&self.state, target).is_none()
+        {
+            self.overrides.remove(&slider);
+            return;
         }
-        let release = if last { Some(now + SLIDER_HOLD) } else { None };
-        self.overrides.insert(slider, (value, release));
-        set_slider(&mut self.state, slider, value, true);
+        let value = ((fraction * 100.0).round() as u8).max(slider.minimum_percent());
+        self.preview_slider_level(slider, value, now, last);
         let due = self
             .last_slider_send
             .get(&slider)
@@ -1909,6 +2036,7 @@ impl Scene {
             changed: false,
             last_sent: None,
         });
+        LevelFeedback::SliderOpened.queue(&mut self.level_feedback);
         self.dirty = true;
         if let Some(x) = drag_to {
             self.move_quick_slider(x, now, false);
@@ -1950,9 +2078,7 @@ impl Scene {
         let slider = qs.slider;
         let value = (qs.fraction * 100.0).round() as u8;
         let last_sent = qs.last_sent;
-        let release = if last { Some(now + SLIDER_HOLD) } else { None };
-        self.overrides.insert(slider, (value, release));
-        set_slider(&mut self.state, slider, value, true);
+        self.preview_slider_level(slider, value, now, last);
         let due = self
             .last_slider_send
             .get(&slider)
@@ -1967,6 +2093,19 @@ impl Scene {
                 .extend(slider_action(&self.state, slider, value));
         }
         self.dirty = true;
+    }
+
+    fn preview_slider_level(&mut self, slider: Slider, value: u8, now: Instant, last: bool) {
+        let release = last.then(|| now + SLIDER_HOLD);
+        let previous = self.overrides.insert(slider, (value, release));
+        if let Some(old) = previous
+            .map(|(v, _)| v)
+            .or_else(|| slider_percent(&self.state, slider))
+            && old != value
+        {
+            LevelFeedback::at(value, slider.minimum_percent()).queue(&mut self.level_feedback);
+        }
+        set_slider(&mut self.state, slider, value, true);
     }
 
     fn finish_quick_slider(&mut self) {
@@ -2384,12 +2523,11 @@ impl Scene {
     }
 
     fn request_menu_data(&mut self, id: &str) {
-        let guards: Vec<Guard> = self
+        let mut guards: Vec<Guard> = self
             .menu
             .children(id)
             .flat_map(|item| {
                 [
-                    (GuardKind::When, &item.when),
                     (GuardKind::Checked, &item.checked),
                     (GuardKind::Disabled, &item.disabled),
                 ]
@@ -2404,6 +2542,16 @@ impl Scene {
                 .collect::<Vec<_>>()
             })
             .collect();
+        guards.extend(
+            self.menu
+                .visibility_guards(id)
+                .into_iter()
+                .map(|(id, expr)| Guard {
+                    id: id.into(),
+                    kind: GuardKind::When,
+                    expr: expr.into(),
+                }),
+        );
         if !guards.is_empty() {
             self.actions.push(Action::EvaluateGuards {
                 menu: id.to_string(),
@@ -2508,13 +2656,30 @@ impl Scene {
 
         // Hold-to-repeat.
         let mut repeats = Vec::new();
+        let level_keys_visible = matches!(self.shown_page(), Page::Keyboard | Page::Controls)
+            && self.state.touch_id.is_none()
+            && self.touch_fx.is_none()
+            && !self.shows_screensaver();
         for touch in self.touches.values_mut() {
-            if let (Some(at), Some(cmd)) = (touch.repeat_at, touch.cmd.clone())
-                && now >= at
-                && !touch.cancelled
+            let (Some(at), Some(cmd)) = (touch.repeat_at, touch.cmd.as_ref()) else {
+                continue;
+            };
+            if touch.cancelled {
+                continue;
+            }
+            if level_keys_visible
+                && (now >= at || touch.repeat_level.is_some())
+                && let Some((level, up)) = step_level(&self.state, cmd)
             {
+                let previous = touch.repeat_level.replace(level);
+                let at_limit = level == if up { 100 } else { 0 };
+                if previous.map_or(at_limit, |old| if up { level > old } else { level < old }) {
+                    LevelFeedback::at(level, 0).queue(&mut self.level_feedback);
+                }
+            }
+            if now >= at {
                 touch.repeat_at = Some(at + REPEAT_EVERY);
-                repeats.push(cmd);
+                repeats.push(cmd.clone());
             }
         }
         for cmd in repeats {
@@ -2638,6 +2803,12 @@ impl Scene {
             live_fx |= fx.animating(self.config.motion.enabled);
             self.last_touch = now;
         }
+        // The screensaver draws whenever its effect prints a new frame.
+        if let Some(saver) = self.saver.as_mut()
+            && std::mem::take(&mut saver.fresh)
+        {
+            live_fx = true;
+        }
 
         // Return to the bar after inactivity (never while typing a password or
         // while a speed test is actively measuring).
@@ -2664,7 +2835,12 @@ impl Scene {
 
         // Idle dimming.
         let p = &self.config.power;
-        let target = if self.state.touch_id.is_some() || !self.touches.is_empty() || keep_open {
+        // The screensaver plays at full brightness, as on the desktop.
+        let target = if self.state.touch_id.is_some()
+            || !self.touches.is_empty()
+            || keep_open
+            || self.saver.is_some()
+        {
             1.0
         } else if p.off_after > 0 && idle > Duration::from_secs(p.off_after as u64) {
             0.0
@@ -2934,27 +3110,41 @@ fn monitor_target(state: &DesktopState, key: Key) -> Option<&str> {
 
 /// A slider's level (0–1) as the desktop reports it.
 fn slider_fraction(state: &DesktopState, slider: Slider) -> f32 {
-    let percent = match slider {
+    let fallback = if matches!(slider, Slider::Display | Slider::Keyboard) {
+        50
+    } else {
+        0
+    };
+    slider_percent(state, slider).unwrap_or(fallback) as f32 / 100.0
+}
+
+fn slider_percent(state: &DesktopState, slider: Slider) -> Option<u8> {
+    match slider {
         Slider::Volume => state
             .audio
             .as_ref()
-            .map_or(0, |a| if a.muted { 0 } else { a.volume }),
-        Slider::Display => state.display_brightness.unwrap_or(50),
-        Slider::Monitor(_) => state
-            .display_panel
-            .as_ref()
-            .and_then(|p| p.brightness)
-            .unwrap_or(0),
-        Slider::Keyboard => state.keyboard_backlight.unwrap_or(50),
-        Slider::Mic => state.mic_volume.unwrap_or(0),
+            .map(|a| if a.muted { 0 } else { a.volume }),
+        Slider::Display => state.display_brightness,
+        Slider::Monitor(_) => state.display_panel.as_ref().and_then(|p| p.brightness),
+        Slider::Keyboard => state.keyboard_backlight,
+        Slider::Mic => state.mic_volume,
         Slider::Stream(id) => state
             .mixer
             .streams
             .iter()
             .find(|s| s.id == id)
-            .map_or(0, |s| s.volume),
+            .map(|s| s.volume),
+    }
+}
+
+fn step_level(state: &DesktopState, cmd: &Cmd) -> Option<(u8, bool)> {
+    let (slider, up) = match cmd {
+        Cmd::Do(Action::StepVolume(up)) => (Slider::Volume, *up),
+        Cmd::Do(Action::StepDisplayBrightness(up)) => (Slider::Display, *up),
+        Cmd::Do(Action::StepKeyboardBacklight(up)) => (Slider::Keyboard, *up),
+        _ => return None,
     };
-    percent as f32 / 100.0
+    Some((slider_percent(state, slider)?, up))
 }
 
 /// Shows a slider's value before the desktop confirms it. Dragging the
@@ -3042,6 +3232,9 @@ pub mod t1_key {
         }
     }
 }
+
+#[cfg(test)]
+mod t1_menus;
 
 #[cfg(test)]
 mod tests {
@@ -3513,6 +3706,111 @@ mod tests {
     }
 
     #[test]
+    fn held_level_keys_follow_confirmed_changes_and_signal_each_limit_once() {
+        let (mut scene, mut now) = settled_scene();
+        scene.command(Command::SetMode(Mode::Keyboard));
+        for _ in 0..60 {
+            now += Duration::from_millis(16);
+            scene.update(now, Utc::now());
+        }
+        for (key, slider, start, step, end, limit) in [
+            ("vu", Slider::Volume, 90, 95, 100, LevelFeedback::Maximum),
+            ("bd", Slider::Display, 12, 6, 0, LevelFeedback::Minimum),
+            ("ku", Slider::Keyboard, 88, 94, 100, LevelFeedback::Maximum),
+        ] {
+            let r = scene.node_rect(Key::new("ctl").with(key)).unwrap();
+            let mut reported = scene.state.clone();
+            set_slider(&mut reported, slider, start, true);
+            scene.set_state(reported.clone());
+            assert!(scene.input(false, &[(0, r.cx(), r.cy())], now));
+            now += REPEAT_DELAY;
+            scene.update(now, Utc::now());
+            assert_eq!(scene.take_level_feedback(), None);
+            for (percent, effect) in [
+                (step, Some(LevelFeedback::Tick)),
+                (step, None),
+                (end, Some(limit)),
+                (end, None),
+            ] {
+                set_slider(&mut reported, slider, percent, true);
+                scene.set_state(reported.clone());
+                now += REPEAT_EVERY;
+                scene.update(now, Utc::now());
+                assert_eq!(scene.take_level_feedback(), effect);
+            }
+            scene.input(false, &[], now);
+            // A fresh hold already at the limit gets one stop cue as repeat begins.
+            scene.input(false, &[(0, r.cx(), r.cy())], now);
+            now += REPEAT_DELAY;
+            scene.update(now, Utc::now());
+            assert_eq!(scene.take_level_feedback(), Some(limit));
+            scene.input(false, &[], now);
+            set_slider(&mut reported, slider, start, true);
+            scene.set_state(reported);
+            now += REPEAT_EVERY;
+            scene.update(now, Utc::now());
+            assert_eq!(scene.take_level_feedback(), None);
+        }
+    }
+
+    #[test]
+    fn panel_sliders_tick_per_new_percentage_and_stop_at_their_own_limits() {
+        // The last case has no monitor helper: the laptop backlight
+        // slider, keyed by Hyprland's focused screen, goes down to 0.
+        for (panel, key, minimum, without_helper) in [
+            (Panel::Audio, Key::new("p/volume"), 0, false),
+            (
+                Panel::Brightness,
+                Key::new("p/display").with("eDP-1"),
+                1,
+                false,
+            ),
+            (Panel::Brightness, Key::new("p/keyboard"), 0, false),
+            (
+                Panel::Brightness,
+                Key::new("p/display").with("eDP-1"),
+                0,
+                true,
+            ),
+        ] {
+            let (mut scene, mut now) = settled_scene();
+            if without_helper {
+                scene
+                    .state_mut()
+                    .display_panel
+                    .as_mut()
+                    .unwrap()
+                    .monitors
+                    .clear();
+            }
+            scene.command(Command::OpenPanel(panel));
+            for _ in 0..60 {
+                now += Duration::from_millis(16);
+                scene.update(now, Utc::now());
+            }
+            let r = scene.node_rect(key).unwrap();
+            for (percent, effect) in [
+                (50, Some(LevelFeedback::Tick)),
+                (51, Some(LevelFeedback::Tick)),
+                (51, None),
+                (100, Some(LevelFeedback::Maximum)),
+                (100, None),
+                (99, Some(LevelFeedback::Tick)),
+                (minimum + 1, Some(LevelFeedback::Tick)),
+                (minimum, Some(LevelFeedback::Minimum)),
+                (0, None),
+            ] {
+                now += Duration::from_millis(50);
+                let x = r.x + 6.0 + (r.w - 12.0) * percent as f32 / 100.0;
+                scene.input(false, &[(0, x, r.cy())], now);
+                assert_eq!(scene.take_level_feedback(), effect, "{key:?} at {percent}%");
+            }
+            scene.input(false, &[], now);
+            assert_eq!(scene.take_level_feedback(), None);
+        }
+    }
+
+    #[test]
     fn bluetooth_panel_pairs_forgets_and_reports_failures() {
         let (mut scene, mut now) = settled_scene();
         let utc = Utc::now();
@@ -3830,6 +4128,129 @@ mod tests {
     }
 
     #[test]
+    fn display_panel_fits_a_lone_laptop_and_names_its_brightness() {
+        let (mut scene, mut now) = settled_scene();
+        scene
+            .state_mut()
+            .display_panel
+            .as_mut()
+            .unwrap()
+            .monitors
+            .truncate(1);
+        scene.command(Command::OpenPanel(Panel::Brightness));
+        for _ in 0..60 {
+            now += Duration::from_millis(16);
+            scene.update(now, Utc::now());
+        }
+        scene.take_actions();
+        // Every control is on the strip without scrolling.
+        assert_eq!(scene.scroll.max, 0.0);
+
+        let texts = |scene: &mut Scene, key: Key| -> (Vec<String>, f32) {
+            let nodes = scene.build();
+            let node = nodes.iter().find(|n| n.key == key).expect("node");
+            let texts = node
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::node::Part::Text { text, role, .. }
+                        if *role != crate::text::Role::Icon =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (texts, node.rect.w)
+        };
+        let hero = Key::new("p/display/hero");
+        let (before, width) = texts(&mut scene, hero);
+        assert_eq!(before, ["Built-in Display", "Golden hour"]);
+
+        // Dimming renames the mood without moving the slider under the finger.
+        let r = scene
+            .node_rect(Key::new("p/display").with("eDP-1"))
+            .unwrap();
+        scene.input(false, &[(0, r.x + 2.0, r.cy())], now);
+        let (during, during_width) = texts(&mut scene, hero);
+        assert_eq!(during[1], "Night owl");
+        assert_eq!(during_width, width);
+        scene.input(false, &[], now);
+        scene.take_actions();
+
+        // Night Light toggles from the panel, like the indicator.
+        let r = scene.node_rect(Key::new("p/display/night")).unwrap();
+        scene.input(false, &[(0, r.cx(), r.cy())], now);
+        scene.input(false, &[], now);
+        assert_eq!(
+            scene.take_actions(),
+            [Action::TriggerIndicator {
+                indicator: Indicator::NightLight,
+                currently_active: true,
+            }]
+        );
+        assert!(!scene.state.indicators.nightlight);
+    }
+
+    #[test]
+    fn panel_controls_grow_in_as_one_piece() {
+        let (mut scene, _) = settled_scene();
+        scene.command(Command::OpenPanel(Panel::Brightness));
+        let nodes = scene.build();
+        let enter = |key: Key| {
+            let node = nodes.iter().find(|n| n.key == key).expect("node");
+            (node.rect, node.enter.expect("enter motion"))
+        };
+        let well = Key::new("p/display/text");
+        let (outer, base) = enter(well);
+        for key in [
+            well.with("pill"),
+            well.with("opt").with("9"),
+            well.with("opt").with("20"),
+        ] {
+            let (rect, motion) = enter(key);
+            assert_eq!(motion.delay, base.delay, "{key:?} waits with its control");
+            assert_eq!(motion.scale, base.scale);
+            // Scaled about the control's center, so it keeps its place in it.
+            let gap = (rect.cx() + motion.dx) - (outer.cx() + base.dx);
+            assert!((gap - (rect.cx() - outer.cx()) * base.scale).abs() < 0.01);
+        }
+        // Controls still cascade one after another.
+        let (_, scale) = enter(Key::new("p/display/scale"));
+        assert!(scale.delay > base.delay);
+    }
+
+    #[test]
+    fn display_panel_names_external_screens_by_model() {
+        let (mut scene, mut now) = settled_scene();
+        scene.command(Command::OpenPanel(Panel::Brightness));
+        for _ in 0..60 {
+            now += Duration::from_millis(16);
+            scene.update(now, Utc::now());
+        }
+        let nodes = scene.build();
+        let card = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.key == Key::new("p/display/output").with(name))
+                .unwrap()
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::node::Part::Text { text, role, .. }
+                        if *role != crate::text::Role::Icon =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(card("eDP-1"), ["Built-in Display", "Focused"]);
+        assert_eq!(card("DP-1"), ["LG ULTRAFINE", "Off · DP-1"]);
+    }
+
+    #[test]
     fn quick_tap_on_audio_and_brightness_still_opens_panels() {
         let (mut scene, mut now) = settled_scene();
         let utc = Utc::now();
@@ -3840,6 +4261,7 @@ mod tests {
         assert!(scene.quick_slider.is_none());
         scene.input(false, &[], now);
         assert_eq!(scene.page(), &Page::Panel(Panel::Audio));
+        assert_eq!(scene.take_level_feedback(), None);
 
         scene.command(Command::Home);
         for _ in 0..80 {
@@ -3855,6 +4277,7 @@ mod tests {
         assert!(scene.quick_slider.is_none());
         scene.input(false, &[], now);
         assert_eq!(scene.page(), &Page::Panel(Panel::Brightness));
+        assert_eq!(scene.take_level_feedback(), None);
     }
 
     #[test]
@@ -3880,6 +4303,14 @@ mod tests {
         assert!(!qs.changed);
         assert_eq!(scene.state.audio.as_ref().unwrap().volume, start_vol);
         assert!(scene.take_actions().is_empty());
+        assert_eq!(
+            scene.take_level_feedback(),
+            Some(LevelFeedback::SliderOpened)
+        );
+        now += Duration::from_millis(60);
+        scene.input(false, &[(0, r.cx(), r.cy())], now);
+        scene.update(now, utc);
+        assert_eq!(scene.take_level_feedback(), None);
 
         // Built bar replaces w/audio with expanded slider and hides overlapped neighbors.
         let nodes = scene.build();
@@ -3902,6 +4333,10 @@ mod tests {
         scene.input(false, &[(0, r.cx() + 120.0, r.cy())], now);
         scene.update(now, utc);
         let raised = scene.state.audio.as_ref().unwrap().volume;
+        assert_eq!(
+            scene.take_level_feedback(),
+            Some(LevelFeedback::at(raised, 0))
+        );
         assert!(
             raised > start_vol + 10,
             "expected volume > {}, got {raised}",
@@ -3952,17 +4387,26 @@ mod tests {
         let track_l = qs.rect.x + 6.0;
         let track_r = qs.rect.right() - 6.0;
         let after_start = scene.state.display_brightness.unwrap();
+        assert_eq!(
+            scene.take_level_feedback(),
+            Some(LevelFeedback::SliderOpened)
+        );
         assert!(
             after_start > 15 && after_start < 40,
             "smooth initial move, got {after_start}"
         );
 
-        // Drag smoothly to the right edge -> reaches 100% cleanly.
+        // Drag smoothly to the right edge -> ticks, then reaches the maximum.
         for step in 1..=12 {
             now += Duration::from_millis(20);
             let x = r.cx() + 18.0 + (track_r - (r.cx() + 18.0)) * (step as f32 / 12.0);
             scene.input(false, &[(0, x, r.cy())], now);
             scene.update(now, utc);
+            let level = scene.state.display_brightness.unwrap();
+            assert_eq!(
+                scene.take_level_feedback(),
+                Some(LevelFeedback::at(level, 0))
+            );
         }
         assert_eq!(scene.state.display_brightness, Some(100));
 
@@ -3974,6 +4418,7 @@ mod tests {
             scene.update(now, utc);
         }
         assert_eq!(scene.state.display_brightness, Some(0));
+        assert_eq!(scene.take_level_feedback(), Some(LevelFeedback::Minimum));
 
         // Release -> final action emitted, morphs back to bar.
         now += Duration::from_millis(20);
@@ -3986,6 +4431,7 @@ mod tests {
                 .take_actions()
                 .contains(&Action::SetDisplayBrightness(0))
         );
+        assert_eq!(scene.take_level_feedback(), None);
     }
 
     #[test]
@@ -4674,8 +5120,13 @@ mod tests {
         };
         let tap = |scene: &mut Scene, key: Key, t: Instant| {
             let r = scene.node_rect(key).expect("node on screen");
-            scene.input(false, &[(0, r.cx(), r.cy())], t);
-            scene.input(false, &[], t + Duration::from_millis(60));
+            let finger = [(0, r.cx(), r.cy())];
+            assert_eq!(
+                scene.input_press_position(false, &finger, t),
+                Some(r.cx() / scene.width)
+            );
+            assert!(!scene.input(false, &finger, t + Duration::from_millis(30)));
+            assert!(!scene.input(false, &[], t + Duration::from_millis(60)));
         };
         scene.command(Command::SetMode(Mode::Keyboard));
         step(&mut scene, 800);
@@ -4766,6 +5217,68 @@ mod tests {
     }
 
     #[test]
+    fn workspace_swipe_cues_follow_the_displayed_order_in_both_directions() {
+        use crate::{
+            config::WorkspaceStyle,
+            state::{Workspace, Workspaces},
+        };
+
+        for style in [WorkspaceStyle::Numbers, WorkspaceStyle::Dots] {
+            let mut config = bar_config();
+            config.appearance.workspace_style = style;
+            config.appearance.min_workspaces = 2;
+            let mut scene = test_scene_with_config(config);
+            // A guest from another block follows the two local workspaces.
+            scene.state_mut().workspaces = Workspaces {
+                block: 1,
+                monitor: "DP-1".into(),
+                active: 11,
+                list: vec![Workspace {
+                    id: 2,
+                    monitor: "DP-1".into(),
+                    ..Workspace::default()
+                }],
+            };
+            let mut now = Instant::now();
+            let utc = Utc::now();
+            for _ in 0..80 {
+                now += Duration::from_millis(16);
+                scene.update(now, utc);
+            }
+
+            let first = scene.node_rect(Key::new("w/ws").index(11)).unwrap();
+            assert!(scene.input(false, &[(0, first.cx(), first.cy())], now));
+            assert_eq!(scene.take_level_feedback(), None);
+            for (id, cue) in [
+                (11, None),
+                (12, Some(LevelFeedback::Tick)),
+                (2, Some(LevelFeedback::Maximum)),
+                (2, None),
+                (12, Some(LevelFeedback::Tick)),
+                (11, Some(LevelFeedback::Minimum)),
+                (11, None),
+            ] {
+                let r = scene.node_rect(Key::new("w/ws").index(id)).unwrap();
+                now += Duration::from_millis(80);
+                assert!(!scene.input(false, &[(0, r.cx(), r.cy())], now));
+                assert_eq!(scene.take_level_feedback(), cue, "{style:?} workspace {id}");
+                assert_eq!(i64::from(scene.state().workspaces.active), id);
+            }
+            scene.input(false, &[], now);
+            assert_eq!(scene.take_level_feedback(), None);
+            let focused: Vec<_> = scene
+                .take_actions()
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::FocusWorkspace { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(focused, [12, 2, 12, 11]);
+        }
+    }
+
+    #[test]
     fn tenth_workspace_displays_as_zero_at_the_end_of_its_block() {
         use crate::{
             node::{Hit, Part},
@@ -4839,5 +5352,74 @@ mod tests {
         let nodes = scene.build();
         let labels: Vec<String> = ws_labels(&nodes).into_iter().map(|(_, t)| t).collect();
         assert_eq!(labels, vec!["1", "2", "3", "4", "5", "0"]);
+    }
+
+    #[test]
+    fn screensaver_takes_the_strip_and_a_touch_ends_it() {
+        let (mut scene, mut now) = settled_scene();
+        let utc = Utc::now();
+        let mut step = |scene: &mut Scene, ms: u64| {
+            for _ in 0..(ms / 16).max(1) {
+                now += Duration::from_millis(16);
+                scene.update(now, utc);
+            }
+            now
+        };
+        let saver = Key::new("screensaver");
+        let geometry = Geometry::fit(10, 2170, 60).unwrap();
+
+        // The whole strip, Esc included, is the screensaver's.
+        scene.screensaver_start(geometry);
+        step(&mut scene, 600);
+        let nodes = scene.build();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].key, saver);
+        assert_eq!(scene.node_rect(saver).map(|r| r.w), Some(2170.0));
+        assert!(scene.node_rect(Key::new("esc")).is_none());
+
+        // Frames make the strip draw; without them it rests.
+        let mut grid = Grid::new(geometry.cols as usize, geometry.rows as usize);
+        grid.cells[0].ch = '█';
+        let t = step(&mut scene, 16);
+        scene.screensaver_frame(Arc::new(grid));
+        assert!(scene.update(t + Duration::from_millis(8), utc));
+        step(&mut scene, 400);
+        assert!(!scene.animating());
+
+        // It plays at full brightness however long nobody touched the strip.
+        scene.config.power.dim_after = 1;
+        step(&mut scene, 1500);
+        assert!(scene.brightness() > 0.99);
+
+        // A touch ends it on the desktop too and presses nothing beneath.
+        let t = step(&mut scene, 16);
+        assert!(!scene.input(false, &[(0, 1085.0, 30.0)], t));
+        scene.input(false, &[], t + Duration::from_millis(60));
+        assert!(!scene.screensaver_active());
+        assert_eq!(scene.take_actions(), vec![Action::DismissScreensaver]);
+        step(&mut scene, 600);
+        assert!(scene.node_rect(saver).is_none());
+        assert!(scene.node_rect(Key::new("esc")).is_some());
+
+        // Touch ID prompts still take over while it runs.
+        scene.screensaver_start(geometry);
+        let mut state = DesktopState::sample();
+        state.touch_id = Some(TouchId {
+            stage: TouchIdStage::Authenticate,
+            progress: None,
+        });
+        scene.set_state(state);
+        step(&mut scene, 600);
+        assert!(scene.node_rect(Key::new("tid/fx")).is_some());
+        assert!(scene.node_rect(saver).is_none());
+
+        // The desktop's screensaver ending wakes the strip.
+        scene.set_state(DesktopState::sample());
+        step(&mut scene, 3000);
+        assert!(scene.node_rect(saver).is_some());
+        scene.screensaver_stop();
+        step(&mut scene, 600);
+        assert!(scene.node_rect(saver).is_none());
+        assert!(scene.brightness() > 0.99);
     }
 }

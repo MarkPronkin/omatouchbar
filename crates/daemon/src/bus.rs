@@ -36,6 +36,7 @@ pub enum Event {
     },
     Control(Command, mpsc::Sender<String>),
     Status(mpsc::Sender<String>),
+    Haptics(crate::haptics::Haptics, mpsc::Sender<String>),
     /// Save the current frame as a PNG (debugging and the settings app).
     Snapshot(String, mpsc::Sender<String>),
     Reload,
@@ -82,6 +83,12 @@ pub enum Event {
         query: String,
         results: Option<Vec<omatouchbar_core::weather::Location>>,
     },
+    /// Omarchy's screensaver window opened (`true`) or closed on the desktop.
+    DesktopScreensaver(bool),
+    /// The Touch Bar's screensaver (see `screensaver`).
+    Screensaver(crate::screensaver::SaverEvent),
+    /// `ctl screensaver [effect|off]`.
+    ScreensaverDemo(Option<String>, mpsc::Sender<String>),
 }
 
 #[derive(Clone)]

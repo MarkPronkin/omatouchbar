@@ -13,7 +13,10 @@ use crate::{
     config::{ButtonStyle, Mode, WorkspaceStyle},
     node::{Anchor, Fill, HitKind, Key, Motion, Node, Part, Rect},
     omarchy::{DEFAULT_CLOCK, Widget, format_qt},
-    scene::{Action, Cmd, Page, Panel, QuickSlider, Scene, Slider, SoundTab, WifiPromptPhase},
+    scene::{
+        Action, Cmd, LevelFeedback, Page, Panel, QuickSlider, Scene, Slider, SoundTab,
+        WifiPromptPhase,
+    },
     speedtest::SpeedPhase,
     state::{
         AudioDevice, AudioDeviceKind, BtDevice, BtKind, BtOp, Charge, DnsProvider, NetKind,
@@ -122,6 +125,7 @@ pub mod glyph {
     pub const CROSSHAIRS_GPS: &str = "\u{F01A4}";
     pub const MAGNIFY: &str = "\u{F0349}";
     pub const MONITOR: &str = "\u{F0379}";
+    pub const MONITOR_MULTIPLE: &str = "\u{F037A}";
     pub const CONSOLE: &str = "\u{F018D}";
     pub const UMBRELLA: &str = "\u{F054A}";
 }
@@ -303,6 +307,13 @@ impl Scene {
     pub(crate) fn build(&mut self) -> Vec<Node> {
         let m = self.m();
         let mut nodes = Vec::new();
+        self.scroll.max = 0.0;
+        self.scroll.x0 = f32::MAX;
+        self.scroll.x1 = f32::MIN;
+        if self.shows_screensaver() {
+            self.build_screensaver(&mut nodes);
+            return nodes;
+        }
         let page = self.shown_page();
         let esc = self.config.show_escape;
         if esc {
@@ -320,9 +331,6 @@ impl Scene {
         } else {
             m.edge
         };
-        self.scroll.max = 0.0;
-        self.scroll.x0 = f32::MAX;
-        self.scroll.x1 = f32::MIN;
         if self.touch_fx.is_some() {
             self.build_touch_id(left, &mut nodes);
             return nodes;
@@ -479,20 +487,6 @@ impl Scene {
             Slider::Mic => (glyph::MIC, false, t.accent),
             Slider::Stream(_) => (glyph::VOLUME_HIGH, false, t.accent),
         };
-        let icon_color = if muted {
-            t.red
-        } else if fraction > 0.08 {
-            t.on_accent
-        } else {
-            t.fg
-        };
-        let pct_color = if fraction > 0.86 {
-            t.on_accent
-        } else if muted {
-            t.fg_faint
-        } else {
-            t.fg
-        };
         let icon_size = m.icon * 0.9;
         let (il, _) = self.fonts.ink_hbounds(icon, icon_size, Role::Icon);
         let fill = Fill {
@@ -512,17 +506,23 @@ impl Scene {
                 inset: 4.0,
                 radius: m.radius - 3.0,
             })
-            .part(Part::icon(
-                icon,
-                icon_size,
-                icon_color,
-                Anchor::Start,
-                16.0 - il,
-            ))
-            .part(Part::label(
+            .part(if muted {
+                Part::icon(icon, icon_size, t.red, Anchor::Start, 16.0 - il)
+            } else {
+                Part::split(
+                    icon,
+                    icon_size,
+                    Role::Icon,
+                    (t.fg, t.on_accent),
+                    Anchor::Start,
+                    16.0 - il,
+                )
+            })
+            .part(Part::split(
                 format!("{value}%"),
                 m.label,
-                pct_color,
+                Role::Text,
+                (if muted { t.fg_faint } else { t.fg }, t.on_accent),
                 Anchor::End,
                 18.0,
             ))
@@ -1017,11 +1017,18 @@ impl Scene {
                 .any(|w| w.id == id && w.windows > 0);
             let is_active = id == active;
             let base = if occupied { t.fg } else { t.fg_faint };
+            let cue = if i == 0 {
+                LevelFeedback::Minimum
+            } else if i + 1 == ids.len() {
+                LevelFeedback::Maximum
+            } else {
+                LevelFeedback::Tick
+            };
             let mut node = Node::new(
                 Key::new("w/ws").index(id as i64),
                 Rect::new(pad + i as f32 * slot, m.inset, slot, m.bh),
             )
-            .hit(Cmd::Workspace(id), HitKind::Scrub)
+            .hit(Cmd::Workspace(id), HitKind::Scrub(cue))
             .emph(if is_active { 1.0 } else { 0.0 })
             .no_ripple();
             node.press_glow = false;
@@ -1249,8 +1256,9 @@ impl Scene {
     }
 
     /// Brightness, keyboard light, media and volume keys in groups between
-    /// `left` and `right`. A group's level shows on a thin meter across it
-    /// for a moment after it changes. Returns how many keys were laid out.
+    /// `left` and `right`. For a moment after a group's level changes, its
+    /// keys fill as one meter in the slider's color (see `Part::Level`).
+    /// Returns how many keys were laid out.
     fn control_keys(&self, left: f32, right: f32, nodes: &mut Vec<Node>) -> usize {
         let m = self.m();
         let t = self.theme.clone();
@@ -1259,9 +1267,12 @@ impl Scene {
         let muted = s.audio.as_ref().is_some_and(|a| a.muted);
         let level = |v: Option<u8>| v.map(|v| v as f32 / 100.0);
         type Keys<'a> = Vec<(&'a str, &'a str, Option<&'a str>, Cmd, HitKind)>;
-        let groups: Vec<(Option<(&'static str, f32)>, Keys)> = vec![
+        let brightness = t.yellow.mix(t.accent, 0.25);
+        // A group's level: its pulse, value and fill color.
+        type Meter = Option<(&'static str, f32, Rgba)>;
+        let groups: Vec<(Meter, Keys)> = vec![
             (
-                level(s.display_brightness).map(|v| ("brightness", v)),
+                level(s.display_brightness).map(|v| ("brightness", v, brightness)),
                 vec![
                     (
                         "bd",
@@ -1280,7 +1291,7 @@ impl Scene {
                 ],
             ),
             (
-                level(s.keyboard_backlight).map(|v| ("keyboard", v)),
+                level(s.keyboard_backlight).map(|v| ("keyboard", v, t.accent)),
                 vec![
                     (
                         "kd",
@@ -1333,6 +1344,7 @@ impl Scene {
                         } else {
                             a.volume as f32 / 100.0
                         },
+                        t.accent,
                     )
                 }),
                 vec![
@@ -1369,8 +1381,8 @@ impl Scene {
         let mut x = left;
         let mut index = 0;
         for (meter, group) in groups {
-            let group_x = x;
-            for (name, g, suffix, cmd, kind) in group {
+            let keys = group.len() as f32;
+            for (i, (name, g, suffix, cmd, kind)) in group.into_iter().enumerate() {
                 let mut node = Node::new(
                     Key::new("ctl").with(name),
                     Rect::new(x.round(), m.inset, w, m.bh),
@@ -1379,14 +1391,36 @@ impl Scene {
                 .hit(cmd, kind)
                 .enter(self.animator.enter.delayed(index as f32 * 0.01))
                 .exit(KEY_EXIT);
+                // The level goes under the icons. Muting says enough on its
+                // own (the mute key turns red), so the volume level hides.
+                if let Some((pulse, value, color)) = meter {
+                    node = node.part(Part::Level {
+                        value,
+                        span: (i as f32 / keys, (i + 1) as f32 / keys),
+                        color,
+                        shown: self.pulses.contains_key(pulse) && !(pulse == "audio" && muted),
+                    });
+                }
                 let color = if name == "mute" && muted { t.red } else { t.fg };
-                match suffix {
-                    Some(sfx) => {
-                        node = node
-                            .part(Part::icon(g, m.icon, color, Anchor::Center, -10.0))
-                            .part(Part::label(sfx, m.label, t.fg_dim, Anchor::Center, 20.0));
-                    }
-                    None => node = node.part(Part::icon(g, m.icon, color, Anchor::Center, 0.0)),
+                let on_fill = |c: Rgba| if meter.is_some() { t.on_accent } else { c };
+                let (icon_dx, role) = (if suffix.is_some() { -10.0 } else { 0.0 }, Role::Icon);
+                node = node.part(Part::split(
+                    g,
+                    m.icon,
+                    role,
+                    (color, on_fill(color)),
+                    Anchor::Center,
+                    icon_dx,
+                ));
+                if let Some(sfx) = suffix {
+                    node = node.part(Part::split(
+                        sfx,
+                        m.label,
+                        Role::Text,
+                        (t.fg_dim, on_fill(t.fg_dim)),
+                        Anchor::Center,
+                        20.0,
+                    ));
                 }
                 if name == "mute" && muted {
                     node.emph = 1.0;
@@ -1395,31 +1429,6 @@ impl Scene {
                 nodes.push(node);
                 x += w + m.gap;
                 index += 1;
-            }
-            if let Some((pulse, value)) = meter.filter(|(pulse, _)| self.pulses.contains_key(pulse))
-            {
-                let inset = 18.0;
-                let group_w = x - m.gap - group_x;
-                nodes.push(
-                    Node::new(
-                        Key::new("ctl/meter").with(pulse),
-                        Rect::new(
-                            (group_x + inset).round(),
-                            m.inset + m.bh - 9.0,
-                            (group_w - inset * 2.0).round(),
-                            4.0,
-                        ),
-                    )
-                    .part(Part::Progress {
-                        value,
-                        color: t.fg,
-                        track: Some(t.fg_faint.alpha(0.35)),
-                        inset: 0.0,
-                        radius: 2.0,
-                    })
-                    .enter(Motion::rise(4.0))
-                    .exit(Motion::rise(4.0)),
-                );
             }
             x += CONTROL_GROUP_GAP - m.gap;
         }
@@ -1564,12 +1573,14 @@ impl Scene {
         let mut shown = 0;
         for item in items {
             let guard = self.guards.get(&item.id).copied().unwrap_or_default();
-            if guard.when == Some(false) {
+            if !self.menu.is_visible(&item, |id| {
+                self.guards.get(id).and_then(|g| g.when) != Some(false)
+            }) {
                 continue;
             }
             let submenu = self.menu.is_submenu(&item);
             let disabled = guard.disabled == Some(true);
-            let checked = guard.checked == Some(true) || item.current;
+            let checked = guard.checked == Some(true) || item.current || disabled;
             let role = if item.logo_icon {
                 Role::Logo
             } else {
@@ -1671,19 +1682,38 @@ impl Scene {
             self.scroll.x1 = self.width - m.edge;
             self.scroll.max = (end - self.scroll.x1).max(0.0);
         }
-        // Grow out of the widget the panel was opened from.
+        // Grow out of the widget the panel was opened from, one control
+        // after another.
         let origin = self.panel_origin.unwrap_or(self.width / 2.0);
         let stagger = self.config.motion.stagger_ms / 1000.0;
-        for (i, node) in nodes[start..].iter_mut().enumerate() {
-            if node.enter.is_none() {
-                let dx = ((origin - node.rect.cx()) * 0.3).clamp(-360.0, 360.0);
-                node.enter = Some(Motion {
-                    dx,
-                    dy: 0.0,
-                    scale: 0.9,
-                    delay: i as f32 * stagger,
-                });
+        let mut slot = 0;
+        let mut control: Option<(Rect, Motion)> = None;
+        for node in &mut nodes[start..] {
+            if node.enter.is_some() {
+                continue;
             }
+            // A control's inner nodes (segments and their pill, a switch's
+            // track and knob) travel with it as one piece, scaling about its
+            // center, instead of drifting in one by one.
+            if let Some((outer, motion)) = control
+                && node.rect.x >= outer.x - 0.5
+                && node.rect.right() <= outer.right() + 0.5
+            {
+                node.enter = Some(Motion {
+                    dx: motion.dx + (outer.cx() - node.rect.cx()) * (1.0 - motion.scale),
+                    ..motion
+                });
+                continue;
+            }
+            let motion = Motion {
+                dx: ((origin - node.rect.cx()) * 0.3).clamp(-360.0, 360.0),
+                dy: 0.0,
+                scale: 0.9,
+                delay: slot as f32 * stagger,
+            };
+            slot += 1;
+            node.enter = Some(motion);
+            control = Some((node.rect, motion));
         }
     }
 
@@ -1704,7 +1734,6 @@ impl Scene {
             .get(&slider)
             .is_some_and(|(_, release)| release.is_none());
         let fraction = value as f32 / 100.0;
-        let icon_color = if fraction > 0.07 { t.on_accent } else { t.fg };
         let mut node = Node::new(key, Rect::new(x, m.inset, w, m.bh))
             .fill(Fill::solid(t.well, m.radius))
             .part(Part::Progress {
@@ -1714,25 +1743,25 @@ impl Scene {
                 inset: 4.0,
                 radius: m.radius - 3.0,
             });
+        // Icon and percentage change color exactly where the fill
+        // crosses them, so neither half-vanishes at the fill's edge.
+        let colors = (t.fg, t.on_accent);
         if let Some(icon) = icon {
-            node = node.part(Part::icon(
+            node = node.part(Part::split(
                 icon,
                 m.icon * 0.9,
-                icon_color,
+                Role::Icon,
+                colors,
                 Anchor::Start,
                 16.0,
             ));
         }
-        // The percentage reads on the fill once the fill passes its middle,
-        // whatever the slider's width.
-        let label = format!("{value}%");
-        let label_mid = w - 18.0 - self.tw(&label, m.label, Role::Text) / 2.0;
-        let on_fill = 4.0 + fraction * (w - 8.0) > label_mid;
         node = node
-            .part(Part::label(
-                label,
+            .part(Part::split(
+                format!("{value}%"),
                 m.label,
-                if on_fill { t.on_accent } else { t.fg },
+                Role::Text,
+                colors,
                 Anchor::End,
                 18.0,
             ))
@@ -3932,6 +3961,22 @@ impl Scene {
         if fx.cancellable() {
             nodes.push(cancel);
         }
+    }
+
+    // --------------------------------------------------------- screensaver
+
+    /// Omarchy's screensaver takes the whole strip, Esc included, the way it
+    /// covers the desktop.
+    fn build_screensaver(&self, nodes: &mut Vec<Node>) {
+        nodes.push(
+            Node::new(
+                Key::new("screensaver"),
+                Rect::new(0.0, 0.0, self.width, self.height),
+            )
+            .part(Part::Screensaver)
+            .no_ripple()
+            .enter(Motion::FADE),
+        );
     }
 
     /// Whether the scene is in a mode where the system bar should be hidden.

@@ -448,6 +448,45 @@ impl Fonts {
         (bitmap.width > 0).then_some(bitmap)
     }
 
+    /// Coverage (`w`×`h`, row-major) of `ch` drawn the way a terminal draws
+    /// it in a `w`×`h` cell: the text font's line height fills the cell and
+    /// the glyph is centered on its advance. Rendered four times larger and
+    /// boxed down, so even a cell a few pixels across keeps the glyph's
+    /// shape. Empty for characters no font has an outline for.
+    pub fn cell_coverage(&self, ch: char, w: u32, h: u32) -> Vec<u8> {
+        const K: u32 = 4;
+        let mut out = vec![0u8; (w * h) as usize];
+        let Some((face, id)) = self.lookup(Role::Text, ch) else {
+            return out;
+        };
+        let f = self.face(face);
+        let (big_w, big_h) = (w * K, h * K);
+        let line = f.font.height_unscaled().max(1.0);
+        let px = big_h as f32 / line;
+        let advance = f.font.h_advance_unscaled(id) * px;
+        let baseline = f.font.ascent_unscaled() * px;
+        let glyph = id.with_scale_and_position(
+            PxScale::from(big_h as f32),
+            ab_glyph::point((big_w as f32 - advance) / 2.0, baseline),
+        );
+        let Some(outlined) = f.font.outline_glyph(glyph) else {
+            return out;
+        };
+        let bounds = outlined.px_bounds();
+        let mut sums = vec![0f32; (w * h) as usize];
+        outlined.draw(|x, y, c| {
+            let x = x as i32 + bounds.min.x.floor() as i32;
+            let y = y as i32 + bounds.min.y.floor() as i32;
+            if x >= 0 && y >= 0 && (x as u32) < big_w && (y as u32) < big_h {
+                sums[((y as u32 / K) * w + x as u32 / K) as usize] += c.clamp(0.0, 1.0);
+            }
+        });
+        for (o, s) in out.iter_mut().zip(sums) {
+            *o = (s / (K * K) as f32 * 255.0 + 0.5).min(255.0) as u8;
+        }
+        out
+    }
+
     /// Cached glyph count (for diagnostics).
     pub fn cached_glyphs(&self) -> usize {
         self.cache.borrow().len()

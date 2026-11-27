@@ -21,8 +21,10 @@ use crate::{
     bus::{Bus, Event, Watched},
     control,
     exec::Exec,
+    haptics::Haptics,
     hw::Hw,
     providers::{self, system},
+    screensaver::SaverEvent,
     sysbar,
     themesync::ThemeSync,
 };
@@ -35,7 +37,7 @@ fn apply_bar_policy(config: &Config) {
     }
 }
 
-fn status(scene: &Scene, hw: &Hw) -> String {
+fn status(scene: &Scene, hw: &Hw, exec: &Exec) -> String {
     let (w, h) = hw.size().unwrap_or((0, 0));
     let page = match scene.page() {
         Page::Bar => "bar".to_string(),
@@ -47,6 +49,7 @@ fn status(scene: &Scene, hw: &Hw) -> String {
         Page::Panel(Panel::Brightness) => "panel:brightness".into(),
         Page::Panel(p) => format!("panel:{}", p.title().to_lowercase()),
     };
+    let haptics = exec.haptics.mode();
     serde_json::json!({
         "running": true,
         "pid": std::process::id(),
@@ -60,7 +63,11 @@ fn status(scene: &Scene, hw: &Hw) -> String {
         "mode": format!("{:?}", scene.config().mode).to_lowercase(),
         "page": page,
         "systemBarHidden": sysbar::is_hidden(),
+        "hapticsProtocol": 1,
+        "haptics": haptics != Haptics::Off,
+        "hapticMode": haptics.command(),
         "brightness": scene.brightness(),
+        "screensaver": scene.screensaver_active().then(|| exec.screensaver.effect()).flatten(),
     })
     .to_string()
 }
@@ -122,7 +129,7 @@ pub fn run() -> i32 {
     };
     scene.set_state(state.clone());
 
-    let mut exec = Exec::new(bus.clone());
+    let mut exec = Exec::new(bus.clone(), (width, height));
     let mut kbd = crate::kbd::KeyboardGrab::new();
     let (refresh, hyprland) = providers::start(&bus, exec.sink.clone());
     exec.refresh = refresh;
@@ -145,6 +152,7 @@ pub fn run() -> i32 {
         exec.display.set_visible(scene.wants_display_panel());
         exec.network_details.configure(&scene);
         exec.bluetooth_scan.configure(&scene);
+        exec.screensaver.configure(scene.config().screensaver);
         let interval = Duration::from_secs_f32(1.0 / scene.config().motion.fps.max(1) as f32);
         let mut timeout = if hw.connected() && need_frame && !hw.can_submit() {
             // All buffers are with the service; its FrameReleased wakes us.
@@ -193,7 +201,7 @@ pub fn run() -> i32 {
                 &hw,
                 &hyprland,
                 &canvas,
-                &exec,
+                &mut exec,
                 &mut theme_sync,
             );
         }
@@ -223,7 +231,10 @@ pub fn run() -> i32 {
                         .collect::<Vec<_>>(),
                     slept.as_millis()
                 );
-                scene.input(frame.fn_pressed, &contacts, now);
+                if let Some(position) = scene.input_press_position(frame.fn_pressed, &contacts, now)
+                {
+                    exec.haptics.press(position);
+                }
                 need_frame = true;
             }
         }
@@ -246,6 +257,13 @@ pub fn run() -> i32 {
         if scene.update(now, Utc::now()) {
             need_frame = true;
         }
+        if let Some(effect) = scene.take_level_feedback()
+            && hw.connected()
+        {
+            exec.haptics.adjust(effect);
+        }
+        exec.haptics
+            .sync_touch_id(scene.state().touch_id.as_ref(), hw.connected());
         let t_update = woke.elapsed();
         kbd.set_active(scene.wants_keyboard(), &bus);
         for action in scene.take_actions() {
@@ -302,6 +320,7 @@ pub fn run() -> i32 {
     }
 
     kbd.stop();
+    exec.screensaver.stop();
     exec.speedtest.stop();
     exec.wifi.cancel();
     sysbar::restore_if_ours();
@@ -317,7 +336,7 @@ fn handle_events(
     hw: &Hw,
     hyprland: &std::sync::mpsc::Sender<()>,
     canvas: &Canvas,
-    exec: &Exec,
+    exec: &mut Exec,
     theme_sync: &mut ThemeSync,
 ) {
     let mut state_changed = false;
@@ -372,7 +391,19 @@ fn handle_events(
                 let _ = reply.send("ok".into());
             }
             Event::Status(reply) => {
-                let _ = reply.send(status(scene, hw));
+                let _ = reply.send(status(scene, hw, exec));
+            }
+            Event::Haptics(mode, reply) => {
+                if !hw.connected() {
+                    let _ = reply.send("error: Touch Bar disconnected".into());
+                    continue;
+                }
+                // Enabling plays the same pulse as a press at the strip's center.
+                let result = exec.haptics.set_mode(mode);
+                let _ = reply.send(match result {
+                    Ok(()) => "ok".into(),
+                    Err(e) => format!("error: Trackpad Haptics unavailable: {e}"),
+                });
             }
             Event::Snapshot(path, reply) => {
                 let result = match canvas.save_png(std::path::Path::new(&path)) {
@@ -440,6 +471,20 @@ fn handle_events(
                     log::info!("theme changed ({cue} after {} ms)", waited.as_millis());
                     scene.set_palette(palette);
                 }
+            }
+            Event::DesktopScreensaver(open) => exec.screensaver.set_desktop(open),
+            Event::Screensaver(event) => match event {
+                SaverEvent::Start(geometry) => scene.screensaver_start(geometry),
+                SaverEvent::Frame => {
+                    if let Some(frame) = exec.screensaver.take_frame() {
+                        scene.screensaver_frame(frame);
+                    }
+                }
+                SaverEvent::Stop => scene.screensaver_stop(),
+            },
+            Event::ScreensaverDemo(effect, reply) => {
+                let result = exec.screensaver.demo(effect);
+                let _ = reply.send(result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()));
             }
             Event::RefreshIndicators(full) => {
                 if let Some(tx) = &exec.refresh.indicators {

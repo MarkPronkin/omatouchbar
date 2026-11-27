@@ -106,6 +106,8 @@ fn entries() -> Vec<Entry> {
 /// How long a file must stay quiet before its change is reported.
 fn debounce(kind: Watched) -> Duration {
     match kind {
+        // T1Bridge atomically publishes a complete record for each scan result.
+        Watched::TouchId => Duration::ZERO,
         // A theme switch swaps the whole directory in at once, and the Touch
         // Bar's reveal has to start with the desktop's (see `themesync`).
         Watched::Theme => Duration::from_millis(15),
@@ -218,7 +220,7 @@ fn run(bus: Bus) -> std::io::Result<()> {
                         pending.insert(kind, Instant::now());
                     }
                     for (_, kind) in &entries[i].files {
-                        if *kind == Watched::WeatherLocation {
+                        if matches!(kind, Watched::WeatherLocation | Watched::TouchId) {
                             pending.insert(*kind, Instant::now());
                         }
                     }

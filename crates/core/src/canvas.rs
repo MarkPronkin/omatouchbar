@@ -22,6 +22,20 @@ pub enum VAlign {
 pub struct ClipRect {
     pub x0: f32,
     pub x1: f32,
+    pub y0: f32,
+    pub y1: f32,
+}
+
+impl ClipRect {
+    /// A full-height band between `x0` and `x1`.
+    pub const fn band(x0: f32, x1: f32) -> ClipRect {
+        ClipRect {
+            x0,
+            x1,
+            y0: f32::NEG_INFINITY,
+            y1: f32::INFINITY,
+        }
+    }
 }
 
 pub struct Canvas {
@@ -87,7 +101,7 @@ impl Canvas {
         self.pixmap.fill(color.alpha(1.0).to_skia());
     }
 
-    /// Restricts drawing to a horizontal band (full height).
+    /// Restricts drawing to a rectangle (usually a full-height band).
     pub fn set_clip(&mut self, clip: Option<ClipRect>) {
         self.clip = clip;
     }
@@ -101,11 +115,12 @@ impl Canvas {
         let stale = !matches!(&self.clip_mask, Some((c, _)) if *c == clip);
         if stale {
             let mut mask = Mask::new(self.pixmap.width(), self.pixmap.height())?;
+            let y0 = clip.y0.max(0.0);
             let rect = tiny_skia::Rect::from_ltrb(
                 clip.x0.max(0.0),
-                0.0,
+                y0,
                 clip.x1.max(clip.x0 + 1.0),
-                self.pixmap.height() as f32,
+                clip.y1.min(self.pixmap.height() as f32).max(y0 + 1.0),
             )?;
             mask.fill_path(
                 &PathBuilder::from_rect(rect),
@@ -409,14 +424,11 @@ impl Canvas {
         }
         let width = self.pixmap.width() as i32;
         let height = self.pixmap.height() as i32;
-        let (clip0, clip1) = match self.clip {
-            Some(c) => (c.x0.max(0.0) as i32, (c.x1 as i32).min(width)),
-            None => (0, width),
-        };
-        let x0 = (x.round() as i32).max(clip0);
-        let x1 = ((x + w).round() as i32).min(clip1);
-        let y0 = (y.round() as i32).max(0);
-        let y1 = ((y + h).round() as i32).min(height);
+        let c = self.clip.unwrap_or(ClipRect::band(0.0, width as f32));
+        let x0 = (x.round() as i32).max(c.x0.max(0.0) as i32);
+        let x1 = ((x + w).round() as i32).min((c.x1 as i32).min(width));
+        let y0 = (y.round() as i32).max(c.y0.max(0.0) as i32);
+        let y1 = ((y + h).round() as i32).min(c.y1.min(height as f32) as i32);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -431,6 +443,46 @@ impl Canvas {
                 data[i] = ((cr * a + data[i] as u32 * inv + 127) / 255) as u8;
                 data[i + 1] = ((cg * a + data[i + 1] as u32 * inv + 127) / 255) as u8;
                 data[i + 2] = ((cb * a + data[i + 2] as u32 * inv + 127) / 255) as u8;
+                data[i + 3] = ((255 * a + data[i + 3] as u32 * inv + 127) / 255) as u8;
+            }
+        }
+    }
+
+    /// Blends `rgb` through a `w`×`h` coverage mask at a whole-pixel
+    /// position, scaled by `opacity`: the screensaver's cells. Ignores the
+    /// clip band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blend_mask(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        mask: &[u8],
+        rgb: [u8; 3],
+        opacity: f32,
+    ) {
+        let width = self.pixmap.width();
+        let height = self.pixmap.height();
+        let k = (opacity.clamp(0.0, 1.0) * 256.0) as u32;
+        if k == 0 || x >= width || y >= height {
+            return;
+        }
+        let (x1, y1) = ((x + w).min(width), (y + h).min(height));
+        let data = self.pixmap.data_mut();
+        for py in y..y1 {
+            let row = &mask[((py - y) * w) as usize..];
+            for px in x..x1 {
+                let a = (row[(px - x) as usize] as u32 * k) >> 8;
+                if a == 0 {
+                    continue;
+                }
+                let inv = 255 - a;
+                let i = ((py * width + px) * 4) as usize;
+                for c in 0..3 {
+                    data[i + c] =
+                        ((rgb[c] as u32 * a + data[i + c] as u32 * inv + 127) / 255) as u8;
+                }
                 data[i + 3] = ((255 * a + data[i + 3] as u32 * inv + 127) / 255) as u8;
             }
         }
@@ -481,14 +533,11 @@ impl Canvas {
         }
         let width = self.pixmap.width() as i32;
         let height = self.pixmap.height() as i32;
-        let (clip0, clip1) = match self.clip {
-            Some(c) => (c.x0.max(0.0) as i32, (c.x1 as i32).min(width)),
-            None => (0, width),
-        };
-        let x0 = (x.round() as i32).max(clip0);
-        let x1 = ((x + w).round() as i32).min(clip1);
-        let y0 = (y.round() as i32).max(0);
-        let y1 = ((y + h).round() as i32).min(height);
+        let c = self.clip.unwrap_or(ClipRect::band(0.0, width as f32));
+        let x0 = (x.round() as i32).max(c.x0.max(0.0) as i32);
+        let x1 = ((x + w).round() as i32).min((c.x1 as i32).min(width));
+        let y0 = (y.round() as i32).max(c.y0.max(0.0) as i32);
+        let y1 = ((y + h).round() as i32).min(c.y1.min(height as f32) as i32);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -604,15 +653,11 @@ impl Canvas {
         let [cr, cg, cb] =
             [color.r, color.g, color.b].map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32);
         let alpha = (color.a.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-        let (clip0, clip1) = match self.clip {
-            Some(c) => (
-                c.x0.max(0.0) as i32,
-                c.x1.min(self.pixmap.width() as f32) as i32,
-            ),
-            None => (0, self.pixmap.width() as i32),
-        };
         let width = self.pixmap.width() as i32;
         let height = self.pixmap.height() as i32;
+        let c = self.clip.unwrap_or(ClipRect::band(0.0, width as f32));
+        let (clip0, clip1) = (c.x0.max(0.0) as i32, c.x1.min(width as f32) as i32);
+        let (row0, row1) = (c.y0.max(0.0) as i32, c.y1.min(height as f32) as i32);
         let data = self.pixmap.data_mut();
         for g in &run.glyphs {
             let pen = x + g.x;
@@ -625,7 +670,7 @@ impl Canvas {
             let oy = baseline + bitmap.top;
             for row in 0..bitmap.height as i32 {
                 let py = oy + row;
-                if py < 0 || py >= height {
+                if py < row0 || py >= row1 {
                     continue;
                 }
                 for col in 0..bitmap.width as i32 {

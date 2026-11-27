@@ -2,7 +2,7 @@
 //!
 //! `cargo run -p omatouchbar-core --example snapshot -- <page> <out.png> [frames]`
 //!
-//! Pages: bar, menu, menu:<id>, sound, sound-input, sound-sources, display(-end), brightness, battery, network,
+//! Pages: bar, menu, menu:<id>, sound, sound-input, sound-sources, display (also -end, -one, -fixed, -cold), brightness, battery, network,
 //! bluetooth (also -busy, -failed, -scan, -off, -end), clock (also -city, -add, -people, -globe, -calendar), tray, weather, weather-end, weather-search,
 //! weather-searching, weather-loading, agents, agents-live (your own records),
 //! agents-edge (alarms, accounts, balance, sign-in), indicators, fkeys, controls,
@@ -40,6 +40,7 @@ fn main() {
         "keyboard"
         | "keyboard-idle"
         | "keyboard-meter"
+        | "keyboard-meter-out"
         | "keyboard-sound"
         | "keyboard-fn"
         | "keyboard-fn-up"
@@ -62,7 +63,8 @@ fn main() {
         MenuTree::load(),
         BarLayout::from_omarchy(),
     );
-    let mut state = DesktopState::sample();
+    let model = std::env::var("SNAPSHOT_MODEL").unwrap_or_default();
+    let mut state = DesktopState::sample_for_model(&model);
     if page == "touchid" {
         state.touch_id = Some(TouchId {
             stage: TouchIdStage::Enrollment,
@@ -77,6 +79,24 @@ fn main() {
     }
     if page == "keyboard-idle" {
         state.media = None;
+    }
+    // The daemon reads monitors in the background (~70 ms through
+    // systemd-run): without a cached read, they land mid-animation.
+    let mut cold_panel = None;
+    if page == "display-cold" {
+        if let Some(panel) = state.display_panel.as_mut() {
+            panel.monitors.truncate(1);
+        }
+        cold_panel = state.display_panel.take();
+    }
+    if page == "display-one" || page == "display-fixed" {
+        // A laptop on its own, as most Touch Bar Macs run.
+        if let Some(panel) = state.display_panel.as_mut() {
+            panel.monitors.truncate(1);
+            if page == "display-fixed" {
+                panel.brightness = None;
+            }
+        }
     }
     if page == "sound-two" {
         state.mixer.outputs.truncate(2);
@@ -159,7 +179,8 @@ fn main() {
         "sound" | "sound-end" | "sound-two" | "cjk-sound" => Some(Command::OpenPanel(Panel::Audio)),
         "sound-input" => Some(Command::OpenSound(SoundTab::Input)),
         "sound-sources" => Some(Command::OpenSound(SoundTab::Sources)),
-        "display" | "display-end" | "brightness" => Some(Command::OpenPanel(Panel::Brightness)),
+        "display" | "display-end" | "display-one" | "display-fixed" | "display-cold"
+        | "brightness" => Some(Command::OpenPanel(Panel::Brightness)),
         "battery" => Some(Command::OpenPanel(Panel::Power)),
         "network"
         | "network-expanded"
@@ -184,6 +205,14 @@ fn main() {
     sheet.fill(tiny_skia::Color::from_rgba8(60, 60, 60, 255));
     if let Some(c) = command {
         scene.command(c);
+    }
+    if matches!(scene.page(), omatouchbar_core::scene::Page::Menu(_)) {
+        for action in scene.take_actions() {
+            if let omatouchbar_core::Action::LoadProvider { menu, provider } = action {
+                let rows = omatouchbar_core::menu::sample_provider_rows(&provider);
+                scene.apply_provider(&menu, &provider, rows);
+            }
+        }
     }
     if page == "clock" || page.starts_with("clock-") {
         use omatouchbar_core::{
@@ -264,18 +293,26 @@ fn main() {
                 scene.apply_weather_suggestions("Kalin", found);
             }
         }
-        "keyboard-meter" => {
-            // Volume and brightness keys pressed: their groups show levels.
+        // Volume and brightness keys pressed: their groups fill as meters.
+        // With frames, -meter shows them light up and -meter-out fade.
+        "keyboard-meter" | "keyboard-meter-out" => {
             let mut state = scene.state().clone();
             if let Some(audio) = state.audio.as_mut() {
                 audio.volume = 62;
             }
             state.display_brightness = state.display_brightness.map(|b| b.saturating_sub(10));
             scene.set_state(state);
-            tick(&mut scene, &mut now, 500);
+            let wait = match (page.as_str(), frames) {
+                ("keyboard-meter", 0) => 500,
+                ("keyboard-meter", _) => 0,
+                _ => 1700,
+            };
+            tick(&mut scene, &mut now, wait);
         }
         // Hold Fn (and let go): render with a frame count to see the swap.
-        "keyboard-fn" => scene.input(true, &[], now),
+        "keyboard-fn" => {
+            scene.input(true, &[], now);
+        }
         "keyboard-fn-up" => {
             scene.input(true, &[], now);
             tick(&mut scene, &mut now, 900);
@@ -420,7 +457,7 @@ fn main() {
         && !page.starts_with("wifi-pass")
         && !matches!(
             page.as_str(),
-            "bluetooth-busy" | "bluetooth-failed" | "keyboard-meter"
+            "bluetooth-busy" | "bluetooth-failed" | "keyboard-meter" | "keyboard-meter-out"
         )
     {
         tick(&mut scene, &mut now, 2000);
@@ -450,6 +487,13 @@ fn main() {
     for row in 0..rows {
         if frames > 0 {
             tick(&mut scene, &mut now, 33);
+        }
+        if row == 2
+            && let Some(panel) = cold_panel.take()
+        {
+            let mut state = scene.state().clone();
+            state.display_panel = Some(panel);
+            scene.set_state(state);
         }
         canvas = {
             let mut c = Canvas::new(T1_WIDTH, T1_HEIGHT);

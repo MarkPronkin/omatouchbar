@@ -6,11 +6,13 @@
 mod bus;
 mod control;
 mod exec;
+mod haptics;
 mod hw;
 mod kbd;
 mod logger;
 mod providers;
 mod run;
+mod screensaver;
 mod selection;
 mod sysbar;
 mod themesync;
@@ -29,11 +31,13 @@ Usage:
                                panel <sound|mic|sources|display|brightness|battery|network|bluetooth|clock|tray|weather|agents|indicators>
                                speedtest   launch the Touch Bar network speed test
                                touchid [unlock|enroll]  play a demo of the Touch ID animation
+                               screensaver [effect|off]  play Omarchy's screensaver on the Touch Bar
                                home        return to the bar
                                mode <keyboard|bar|controls|function>
                                reload      reload config, theme, layout and menu
                                snapshot <file.png>  save the current frame
                                debug <on|off>      verbose logging to the journal
+                               haptics <medium|zoned|on|off>    medium, position-based, original, or off
   omatouchbar restore-bar    Show the on-screen Omarchy bar if omatouchbar hid it
 
 Settings live in ~/.config/omatouchbar/config.toml (edit with omatouchbar-settings).

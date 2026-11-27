@@ -7,7 +7,7 @@
 use crate::{
     canvas::VAlign,
     color::Rgba,
-    scene::{Cmd, Slider},
+    scene::{Cmd, LevelFeedback, Slider},
     text::Role,
 };
 
@@ -182,6 +182,18 @@ pub enum Part {
         dy: f32,
         valign: VAlign,
     },
+    /// Text over the node's `Progress` fill: `on_fill` where the fill
+    /// covers it and `color` elsewhere, split at the fill's animated edge,
+    /// so a value near that edge never fades into the fill or the track.
+    SplitText {
+        text: String,
+        size: f32,
+        role: Role,
+        color: Rgba,
+        on_fill: Rgba,
+        anchor: Anchor,
+        dx: f32,
+    },
     /// A horizontal fill from the left edge (sliders, meters).
     Progress {
         value: f32,
@@ -189,6 +201,17 @@ pub enum Part {
         track: Option<Rgba>,
         inset: f32,
         radius: f32,
+    },
+    /// A level read across a row of keys (Keyboard mode's brightness,
+    /// keyboard light and volume): this key covers `span` of the row, and
+    /// tints from its left up to wherever `value` falls in it, so the row's
+    /// keys fill as one meter with a bright edge at the value. Springs like
+    /// `Progress`; `shown` fades it in and out.
+    Level {
+        value: f32,
+        span: (f32, f32),
+        color: Rgba,
+        shown: bool,
     },
     Dot {
         anchor: Anchor,
@@ -204,6 +227,8 @@ pub enum Part {
     /// The Touch ID overlay effect (drawn from the scene's live prompt
     /// timeline; see `touchfx`).
     TouchFx,
+    /// Omarchy's screensaver: the effect's latest frame (see `screensaver`).
+    Screensaver,
 }
 
 impl Part {
@@ -232,6 +257,26 @@ impl Part {
             dx,
             dy: 0.0,
             valign: VAlign::Ink,
+        }
+    }
+
+    /// A slider's icon or label, two-toned across its fill (see `SplitText`).
+    pub fn split(
+        text: impl Into<String>,
+        size: f32,
+        role: Role,
+        (color, on_fill): (Rgba, Rgba),
+        anchor: Anchor,
+        dx: f32,
+    ) -> Part {
+        Part::SplitText {
+            text: text.into(),
+            size,
+            role,
+            color,
+            on_fill,
+            anchor,
+            dx,
         }
     }
 
@@ -266,8 +311,8 @@ pub enum HitKind {
     Repeat,
     /// Continuous horizontal value while dragging.
     Slider,
-    /// Fires on touch-down and again when the finger slides onto a sibling.
-    Scrub,
+    /// Fires on touch-down. Sliding in from a sibling also plays this cue.
+    Scrub(LevelFeedback),
 }
 
 #[derive(Clone, Debug, PartialEq)]

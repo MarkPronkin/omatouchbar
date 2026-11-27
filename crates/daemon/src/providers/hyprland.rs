@@ -12,7 +12,7 @@ use std::{
 };
 
 use omatouchbar_core::{
-    paths,
+    paths, screensaver,
     state::{Keyboard, Workspace, Workspaces},
 };
 use serde_json::Value;
@@ -54,6 +54,20 @@ pub fn animations_enabled() -> Option<bool> {
     request(&instance_dir()?, "j/getoption animations:enabled")?
         .get("bool")?
         .as_bool()
+}
+
+/// Each output's EDID maker and model, keyed by connector, including
+/// disabled outputs.
+pub fn monitor_models() -> Vec<(String, String, String)> {
+    let Some(Value::Array(list)) = instance_dir().and_then(|dir| request(&dir, "j/monitors all"))
+    else {
+        return vec![];
+    };
+    let field = |m: &Value, key: &str| m.get(key).and_then(Value::as_str).unwrap_or("").to_owned();
+    list.iter()
+        .map(|m| (field(m, "name"), field(m, "make"), field(m, "model")))
+        .filter(|(name, _, _)| !name.is_empty())
+        .collect()
 }
 
 fn monitor_blocks() -> Vec<(String, i32)> {
@@ -169,6 +183,20 @@ fn refresh(dir: &PathBuf, bus: &Bus) -> String {
     active_class
 }
 
+/// Omarchy's screensaver windows (one per monitor), by address as events
+/// name them (no `0x`).
+fn screensaver_windows(dir: &PathBuf) -> HashSet<String> {
+    let Some(Value::Array(clients)) = request(dir, "j/clients") else {
+        return HashSet::new();
+    };
+    clients
+        .iter()
+        .filter(|c| c.get("class").and_then(Value::as_str) == Some(screensaver::WINDOW_CLASS))
+        .filter_map(|c| c.get("address")?.as_str())
+        .map(|a| a.trim_start_matches("0x").to_string())
+        .collect()
+}
+
 pub fn spawn(bus: Bus) -> mpsc::Sender<()> {
     let (tx, rx) = mpsc::channel::<()>();
     let poke = tx.clone();
@@ -180,13 +208,19 @@ pub fn spawn(bus: Bus) -> mpsc::Sender<()> {
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 };
-                let mut last_class = refresh(&dir, &bus);
-                let mut omarchy_terminals: HashSet<String> = HashSet::new();
-                let mut saw_untracked_omarchy_terminal = last_class == "org.omarchy.terminal";
+                // Subscribe before querying clients so an opening or closing
+                // screensaver window during the snapshot is queued for us.
                 let Ok(stream) = UnixStream::connect(dir.join(".socket2.sock")) else {
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 };
+                let mut last_class = refresh(&dir, &bus);
+                let mut omarchy_terminals: HashSet<String> = HashSet::new();
+                // Omarchy's own idle service follows the screensaver the
+                // same way: by its windows opening and closing.
+                let mut savers = screensaver_windows(&dir);
+                bus.send(Event::DesktopScreensaver(!savers.is_empty()));
+                let mut saw_untracked_omarchy_terminal = last_class == "org.omarchy.terminal";
                 // Read events on a helper thread; coalesce bursts here.
                 let (events_tx, events_rx) = mpsc::channel::<String>();
                 let reader = thread::spawn(move || {
@@ -212,9 +246,15 @@ pub fn spawn(bus: Bus) -> mpsc::Sender<()> {
                                 let mut fields = data.splitn(4, ',');
                                 if let (Some(addr), Some(_), Some(class)) =
                                     (fields.next(), fields.next(), fields.next())
-                                    && class == "org.omarchy.terminal"
                                 {
-                                    omarchy_terminals.insert(addr.trim().to_string());
+                                    if class == "org.omarchy.terminal" {
+                                        omarchy_terminals.insert(addr.trim().to_string());
+                                    } else if class == screensaver::WINDOW_CLASS
+                                        && savers.insert(addr.trim().to_string())
+                                        && savers.len() == 1
+                                    {
+                                        bus.send(Event::DesktopScreensaver(true));
+                                    }
                                 }
                             } else if name == "activewindow"
                                 && data.starts_with("org.omarchy.terminal,")
@@ -222,6 +262,9 @@ pub fn spawn(bus: Bus) -> mpsc::Sender<()> {
                             {
                                 saw_untracked_omarchy_terminal = true;
                             } else if name == "closewindow" {
+                                if savers.remove(data.trim()) && savers.is_empty() {
+                                    bus.send(Event::DesktopScreensaver(false));
+                                }
                                 let closed_tracked = omarchy_terminals.remove(data.trim());
                                 let closed_untracked = omarchy_terminals.is_empty()
                                     && (saw_untracked_omarchy_terminal
@@ -282,6 +325,9 @@ pub fn spawn(bus: Bus) -> mpsc::Sender<()> {
                     }
                 }
                 let _ = reader.join();
+                if !savers.is_empty() {
+                    bus.send(Event::DesktopScreensaver(false));
+                }
                 thread::sleep(Duration::from_millis(500));
             }
         })

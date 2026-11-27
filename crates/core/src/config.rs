@@ -231,6 +231,9 @@ pub struct Config {
     pub show_escape: bool,
     /// Show the on-screen OSD when the Touch Bar changes volume/brightness.
     pub osd: bool,
+    /// Play Omarchy's screensaver on the Touch Bar while it runs on the
+    /// desktop.
+    pub screensaver: bool,
     pub layout: Layout,
     pub appearance: Appearance,
     pub motion: Motion,
@@ -245,6 +248,7 @@ impl Default for Config {
             hide_system_bar: true,
             show_escape: true,
             osd: false,
+            screensaver: true,
             layout: Layout::default(),
             appearance: Appearance::default(),
             motion: Motion::default(),
@@ -332,6 +336,7 @@ mod tests {
         assert_eq!(partial.mode, Mode::Function);
         assert_eq!(partial.motion.speed, 3.0);
         assert!(partial.show_escape);
+        assert!(partial.screensaver);
         assert!(partial.appearance.brightness_percentage);
         assert!(partial.appearance.weather_temperature);
         assert!(!partial.appearance.now_playing);

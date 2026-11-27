@@ -93,6 +93,7 @@ struct Params {
     press: SpringParams,
     emph: SpringParams,
     progress: SpringParams,
+    level_out: SpringParams,
 }
 
 impl Params {
@@ -105,6 +106,7 @@ impl Params {
             press: SpringParams::new(0.11, 1.0),
             emph: SpringParams::new(0.28 / s, 1.0),
             progress: SpringParams::new(0.22 / s, (zeta + 0.25).min(1.0)),
+            level_out: SpringParams::new(0.42 / s, 1.0),
         }
     }
 }
@@ -133,6 +135,8 @@ pub struct Animated {
     pub emph: Spring,
     pub press: Spring,
     pub progress: Spring,
+    /// How much of a `Level` part shows (0 hidden, 1 shown).
+    pub level: Spring,
     pub ripples: Vec<Ripple>,
     pub exiting: bool,
     delay: f32,
@@ -150,9 +154,17 @@ impl Animated {
 
     fn progress_target(node: &Node) -> Option<f32> {
         node.parts.iter().find_map(|p| match p {
-            Part::Progress { value, .. } => Some(*value),
+            Part::Progress { value, .. } | Part::Level { value, .. } => Some(*value),
             _ => None,
         })
+    }
+
+    fn level_target(node: &Node) -> f32 {
+        let shown = node
+            .parts
+            .iter()
+            .any(|p| matches!(p, Part::Level { shown: true, .. }));
+        if shown { 1.0 } else { 0.0 }
     }
 }
 
@@ -239,6 +251,10 @@ impl Animator {
                             a.progress.target = p;
                         }
                     }
+                    a.level.target = Animated::level_target(&node);
+                    if !animate {
+                        a.level.snap(a.level.target);
+                    }
                     a.node = node;
                     a
                 }
@@ -255,6 +271,7 @@ impl Animator {
                         emph: Spring::new(node.emph),
                         press: Spring::new(0.0),
                         progress: Spring::new(progress),
+                        level: Spring::new(0.0),
                         ripples: Vec::new(),
                         exiting: false,
                         delay: m.delay,
@@ -264,11 +281,13 @@ impl Animator {
                     a.y.target = r.y;
                     a.opacity.target = a.node.opacity;
                     a.scale.target = 1.0;
+                    a.level.target = Animated::level_target(&a.node);
                     if !animate {
                         a.x.snap(r.x);
                         a.y.snap(r.y);
                         a.opacity.snap(a.node.opacity);
                         a.scale.snap(1.0);
+                        a.level.snap(a.level.target);
                         a.delay = 0.0;
                     }
                     a
@@ -331,6 +350,7 @@ impl Animator {
                 a.scale.snap(a.scale.target);
                 a.emph.snap(a.emph.target);
                 a.progress.snap(a.progress.target);
+                a.level.snap(a.level.target);
                 continue;
             }
             if a.delay > 0.0 {
@@ -346,6 +366,13 @@ impl Animator {
             moving |= a.opacity.step(dt, p.fade, 0.002);
             moving |= a.emph.step(dt, p.emph, 0.002);
             moving |= a.progress.step(dt, p.progress, 0.0005);
+            // A level lights up quickly and lingers on its way out.
+            let level = if a.level.target >= a.level.value {
+                p.fade
+            } else {
+                p.level_out
+            };
+            moving |= a.level.step(dt, level, 0.002);
         }
         let before = self.items.len();
         self.items
@@ -402,12 +429,24 @@ impl Animator {
         offsets: &dyn Fn(Option<u8>) -> f32,
         pad: f32,
     ) -> Option<Key> {
+        self.hit_test_visible(x, y, pad, |a| Some(a.rect().offset(-offsets(a.node.group))))
+    }
+
+    pub(crate) fn hit_test_visible(
+        &self,
+        x: f32,
+        y: f32,
+        pad: f32,
+        visible_rect: impl Fn(&Animated) -> Option<Rect>,
+    ) -> Option<Key> {
         let mut best: Option<(Key, f32)> = None;
         for a in self.items.iter().rev() {
             if a.exiting || a.node.hit.is_none() || a.opacity.target < 0.5 {
                 continue;
             }
-            let rect = a.rect().offset(-offsets(a.node.group));
+            let Some(rect) = visible_rect(a) else {
+                continue;
+            };
             if rect.contains(x, y, 0.0) {
                 return Some(a.node.key);
             }

@@ -7,10 +7,18 @@ and preview it on the desktop.
 
 ## Hardware scope
 
-The current target is the 2016–2017 MacBook Pro with a T1 chip and Touch Bar
-(for example, `MacBookPro14,3`). The renderer talks to the hardware through
-T1Bridge. MacBook Pro models with a Touch Bar and a T2, M1, or M2 chip are in
-scope for future support.
+omatouchbar supports the 2016 and 2017 T1 MacBook Pro models with a Touch Bar.
+
+| MacBook Pro | 2016 | 2017 |
+| --- | --- | --- |
+| 13-inch, four Thunderbolt 3 ports | `MacBookPro13,2` | `MacBookPro14,2` |
+| 15-inch | `MacBookPro13,3` | `MacBookPro14,3` |
+
+Both sizes use the same 2170 × 60 Touch Bar layout. T1Bridge supplies the
+strip dimensions and touch coordinates automatically. The settings preview
+uses the Mac's model to show the matching Retina display scale choices.
+MacBook Pro models with a Touch Bar and a T2, M1, or M2 chip are in scope
+for future support. [T1Bridge hardware coverage](https://github.com/standardagents/t1bridge#supported-hardware)
 
 ## Features
 
@@ -19,8 +27,8 @@ scope for future support.
   play-pause / next and mute / volume keys (hold to repeat), with a player
   on the right. The player shows what's playing (or your output when
   nothing is) and opens the full Sound panel when tapped; Back or the panel
-  timeout returns to the keys. A thin meter under a group shows its level
-  for a moment after it changes. Holding Fn shows F1–F12, and Touch ID
+  timeout returns to the keys. When a level changes, its group's keys fill
+  up to it like one slider for a moment. Holding Fn shows F1–F12, and Touch ID
   takes over the strip as in every mode. Switch modes in Touch Bar
   settings.
 - **Omarchy Bar mode** — moves the Omarchy top bar onto the Touch Bar and
@@ -125,9 +133,13 @@ scope for future support.
   strip, and a check mark draws itself. Status text decrypts itself,
   everything uses your theme's colors, and with motion off it settles to a
   still frame. `omatouchbar ctl touchid [unlock|enroll]` plays a demo.
+- **Screensaver** plays Omarchy’s branding on the strip while the desktop
+  screensaver is open. Each time the desktop starts a new `ttfx` effect,
+  the strip starts its own random effect. Tap the strip to dismiss both.
+  This is enabled by default in **Touch Bar → Power → Follow desktop screensaver**.
 - **Motion**: every node springs between layouts (position, size, color,
   emphasis), with staggered entrances, ink ripples, a sliding workspace pill,
-  rolling clock digits and inline level meters when volume/brightness change.
+  rolling clock digits and key rows that fill as levels when volume/brightness change.
   Speed, bounce, stagger and frame rate are adjustable.
 - **Follows your Omarchy theme live**: switch themes and the new one opens
   out of the middle of the strip in the same slanted wipe the desktop plays
@@ -140,7 +152,7 @@ scope for future support.
 - A T1 MacBook Pro running [Omarchy](https://omarchy.org) with
   [T1Bridge](https://github.com/standardagents/t1bridge) set up (the Touch Bar
   hardware service `t1-touchbar-hw` and renderer launcher `t1-touchbar`).
-- Rust (`sudo pacman -S rust`), GTK 4, libadwaita and librsvg
+- Rust (`sudo pacman -S rust`), GTK 4, libadwaita, gtk4-layer-shell and librsvg
   (`rsvg-convert` renders the provider artwork). The Time panel uses Node.js
   and Omarchy’s installed Elsewhen and calendar models. ImageMagick decodes
   cached GitHub avatars when available.
@@ -157,8 +169,25 @@ scope for future support.
 built-in renderer.
 
 Open **Setup → Touch Bar** from the Omarchy menu (`omatouchbar-settings`) to
-configure it. The settings app has a live, clickable preview that runs the same
-engine as the Touch Bar.
+configure it. Like Omarchy's launcher, it opens as a card floating over the
+dimmed desktop (a layer-shell overlay); Esc or a click outside closes it, and
+settings save as you change them. Inside it looks like Omarchy's own apps: your
+theme's colors, Hyprland's rounding and the system monospace font. It has a
+live, clickable preview that runs the same engine as the Touch Bar.
+
+The first time it opens it plays a short tour: the four modes shown one by one
+on the preview, with each part of the strip labelled, then what Fn does. Replay
+it from **About** or with `omatouchbar-settings --tour`.
+`omatouchbar-settings --window` opens it as an ordinary window instead.
+
+| Key | Action |
+| --- | --- |
+| `Esc` / `Super+W` | Close |
+| `Ctrl+1`–`Ctrl+7` | Jump to a page |
+| `↑` / `↓` | Move through the pages |
+| `Ctrl+O` | Open `config.toml` |
+| `Ctrl+Q` | Quit |
+| `←` / `→` | Pick a mode (in the tour) |
 
 To remove it: `./uninstall.sh` (restores the previous renderer and the
 on-screen bar; keeps your settings).
@@ -171,6 +200,8 @@ omatouchbar ctl menu [id]          # open the Omarchy menu, e.g. `ctl menu syste
 omatouchbar ctl panel sound        # sound|mic|sources|display|brightness|battery|network|bluetooth|clock|tray|weather|agents|indicators
 omatouchbar ctl home
 omatouchbar ctl touchid enroll     # demo the Touch ID animation (unlock|enroll)
+omatouchbar ctl screensaver beams  # preview a ttfx effect on the strip alone
+omatouchbar ctl screensaver off    # end the preview
 omatouchbar ctl mode bar           # keyboard|bar|controls|function
 omatouchbar ctl reload
 omatouchbar ctl snapshot frame.png # save what the Touch Bar shows right now
@@ -180,6 +211,42 @@ omatouchbar restore-bar            # show the on-screen bar if omatouchbar hid i
 ```
 
 Logs: `journalctl --user -u t1-touchbar.service -f`.
+
+### Trackpad Haptics
+
+Install the separate **Trackpad Haptics** project and open **Setup → Trackpad
+Haptics** to enable Touch Bar feedback. The renderer sends gesture events to
+its optional user service. The app owns the Apple SPI driver, pulse patterns
+and saved preferences. Omatouchbar also runs independently when the player
+is absent.
+
+In bar mode, hold the volume or brightness button for a firm click as it
+expands into a slider. Sliding sideways on the button also opens it. Drag
+slowly to feel a light tick for each percentage change. The same ticks work
+on the Sound panel’s volume sliders and the Display panel’s screen and
+keyboard brightness sliders. Holding a volume or brightness key in keyboard
+mode also ticks as the reported level changes.
+
+A fast sweep skips intermediate ticks. Reaching minimum gives a firm tap
+then a light one. Reaching maximum gives a light tap then a firm one.
+The monitor brightness slider reaches its minimum at 1%. Holding at a limit
+stays quiet after the pair.
+
+Swipe across the workspace selector to feel a light tick as you enter each
+interior workspace. Entering the leftmost workspace gives a firm tap then a
+light one. Entering the rightmost gives a light tap then a firm one. Resting
+on a workspace stays quiet. This works with both numbers and dots.
+
+Touch ID gives one light tap when a fingerprint prompt opens. Each increase
+in enrollment progress gives one medium tap. A scan that needs another try
+gives two firm taps. Success gives a light tap followed by a firm one.
+These cues follow T1Bridge's reported stages. The idle sensor and a prompt
+waiting for your finger stay quiet. To feel the sequence on the Touch Bar,
+run `omatouchbar ctl touchid unlock` or `omatouchbar ctl touchid enroll`.
+
+The advanced controls `omatouchbar ctl haptics medium|zoned|on|off` use the
+same saved preference as the app. Medium gives each button the same click.
+Zoned varies the strength across the strip. On selects the original firm click.
 
 ## Settings
 
@@ -191,6 +258,7 @@ mode = "keyboard"         # keyboard | bar | controls | function
 fn_key = "function"       # what holding Fn shows: function | controls | none
 hide_system_bar = true    # in Omarchy Bar mode
 show_escape = true
+screensaver = true           # follow Omarchy’s desktop screensaver
 
 [layout]
 source = "omarchy"        # mirror shell.json, or "custom" with the lists below
@@ -217,7 +285,8 @@ crates/core      theme, config, fonts (ab_glyph), canvas (tiny-skia),
 crates/daemon    `omatouchbar`: event loop, damage-tracked frame submission,
                  providers (Hyprland IPC, PipeWire, UPower, power-profiles,
                  BlueZ, NetworkManager, MPRIS, sysfs), control socket
-crates/settings  `omatouchbar-settings`: GTK 4 / libadwaita app
+crates/settings  `omatouchbar-settings`: GTK 4 app on a layer-shell overlay
+                 (gtk4-layer-shell), styled like Omarchy's apps
 ```
 
 The renderer runs unprivileged as the T1Bridge-selected renderer: it draws
@@ -229,7 +298,9 @@ renderer's `NoNewPrivileges` sandbox.
 Design checks without hardware:
 
 ```bash
-cargo run -p omatouchbar-core --example snapshot -- bar /tmp/bar.png       # or menu, sound, network, bluetooth(-busy, -failed), weather, fkeys, keyboard(-idle, -meter, -sound), …
+cargo test -p omatouchbar-core scene::t1_menus  # T1 menu rendering, scrolling, and touch targets
+cargo run -p omatouchbar-core --example snapshot -- bar /tmp/bar.png       # or menu, sound, network, bluetooth(-busy, -failed), weather, fkeys, keyboard(-idle, -meter, -meter-out, -sound), …
+SNAPSHOT_MODEL=MacBookPro14,2 cargo run -p omatouchbar-core --example snapshot -- display-end /tmp/display-13.png
 cargo run -p omatouchbar-core --example snapshot -- agents-live /tmp/a.png # your own agent records (agents-edge: every state; add -end, or SNAPSHOT_SCROLL=<px>)
 cargo run -p omatouchbar-core --example snapshot -- menu /tmp/menu.png 12  # contact sheet of a transition
 SNAPSHOT_THEME=gruvbox cargo run -p omatouchbar-core --example snapshot -- theme-wipe /tmp/w.png 26  # a theme switch
